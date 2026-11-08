@@ -79,6 +79,7 @@ from server import (
     new_session_id,
     prepare_hls_dir,
 )
+from session_watch import diagnose, local_ip_for
 from version import get_fluxcast_version
 
 
@@ -313,6 +314,42 @@ def _wait_for_hls_segments(required_segments: int = 2, timeout: float = 15.0) ->
     return False
 
 
+def _watch_session(args, tv, tv_ip, current_host, capture, transport_state, shutdown) -> None:
+    """Stay with the cast and say what the TV is doing.
+
+    Replaces a bare signal.pause(): a capture pipeline that died, a TV that
+    stopped, or a TV that never fetched the stream used to look identical.
+    `transport_state` is dlna.transport_state, or None for Cast (whose status
+    listener already prints state changes).
+    """
+    started = time.monotonic()
+    next_poll = started + 3.0
+    explained = False
+    last_state = None
+    capture_proc = capture.process if capture is not None else None
+    while True:
+        time.sleep(1.0)
+        now = time.monotonic()
+        if capture_proc is not None and capture_proc.poll() is not None:
+            print(f"[FluxCast] ERROR: screen capture stopped (exit code "
+                  f"{capture_proc.returncode}); the TV gets no new video.")
+            shutdown(exit_code=1)
+        if transport_state is not None and now >= next_poll:
+            next_poll = now + 3.0
+            state, status = transport_state(tv)
+            if state and state != last_state:
+                detail = f" ({status})" if status and status != "OK" else ""
+                print(f"[FluxCast] TV state: {state}{detail}")
+                last_state = state
+        stopped = last_state in ("STOPPED", "NO_MEDIA_PRESENT") and now - started > 5
+        if not explained and (stopped or now - started >= 20):
+            explained = True
+            message = diagnose(server.request_stats.snapshot(), tv_ip=tv_ip,
+                               host=current_host(), port=args.port, tv_state=last_state)
+            if message:
+                print(f"[FluxCast] {message}")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -377,7 +414,7 @@ def main() -> None:
     stream_server = None
     tv = None
 
-    def shutdown(signum=None, frame=None):
+    def shutdown(signum=None, frame=None, exit_code=0):
         print("\n[FluxCast] Stopping…")
         if tv is not None:
             try:
@@ -394,7 +431,7 @@ def main() -> None:
         stop_capture(ffmpeg_procs)
         _restore_term(_tty_state)
         print("[FluxCast] Stopped. Goodbye!")
-        sys.exit(0)
+        sys.exit(exit_code)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -453,28 +490,80 @@ def main() -> None:
         shutdown()
     print("[FluxCast] HLS source is producing segments ✓")
 
+    def serve_for(tv_ip: str) -> None:
+        """Serve on the address that routes to the TV (VPNs, second NICs)."""
+        nonlocal host, stream_url, stream_server
+        route_ip = local_ip_for(tv_ip)
+        if args.host or not route_ip or route_ip == host:
+            return
+        print(f"[FluxCast] {host} is not on the TV's network; serving the stream "
+              f"on {route_ip} instead (use --host to choose).")
+        stream_server.stop()
+        moved = StreamServer(host=route_ip, port=args.port,
+                             handler_class=handler_class, session_id=session_id)
+        try:
+            moved.start()
+        except OSError as exc:
+            print(f"[FluxCast] ERROR: Could not bind HTTP server to {route_ip}:{args.port}: {exc}")
+            stream_server = None
+            shutdown(exit_code=1)
+        stream_server = moved
+        host = route_ip
+        stream_url = f"http://{host}:{args.port}/{stream_path}"
+        print(f"[FluxCast] HTTP server: {stream_url}")
+
+    def explain_and_exit() -> None:
+        message = diagnose(server.request_stats.snapshot(), tv_ip=tv_ip,
+                           host=host, port=args.port)
+        if message:
+            print(f"[FluxCast] {message}")
+        shutdown(exit_code=1)
+
     if args.protocol == "dlna":
-        from dlna import discover_devices, prompt_device, start_cast
+        from dlna import (
+            accepts_hls, choose_protocol_info, content_features, discover_devices,
+            prompt_device, protocol_mime, sink_protocol_info, start_cast, transport_state,
+        )
         devices = discover_devices(timeout=args.discover_timeout)
         tv = prompt_device(devices, args.device_name)
-        stream_server.allow_client(device_client_ip(tv, "dlna"))
-        start_cast(tv, stream_url)
+        tv_ip = device_client_ip(tv, "dlna")
+        serve_for(tv_ip)
+        stream_server.allow_client(tv_ip)
+
+        sink = sink_protocol_info(tv)
+        if sink:
+            hls = accepts_hls(sink)
+            print(f"[FluxCast] {tv.friendly_name} lists {len(sink)} playable formats "
+                  f"(HLS: {'yes' if hls else 'no'}).")
+        if stream_path.endswith(".m3u8") and accepts_hls(sink) is False:
+            print("[FluxCast] This TV does not list HLS among the formats it plays over "
+                  "DLNA; sending progressive-ts instead.")
+            stream_path = f"{session_id}/progressive.ts"
+            stream_url = f"http://{host}:{args.port}/{stream_path}"
+        protocol_info = choose_protocol_info(stream_url, sink)
+        if not stream_url.endswith(".m3u8"):
+            server.set_dlna_ts_profile(protocol_mime(protocol_info),
+                                       content_features(protocol_info))
+        if not start_cast(tv, stream_url, protocol_info):
+            explain_and_exit()
 
     else:  # cast protocol
         from cast import discover_devices, connect_by_ip, prompt_device, start_cast
+        transport_state = None
         if args.tv_ip:
             tv = connect_by_ip(args.tv_ip)
-            stream_server.allow_client(device_client_ip(tv, "cast"))
-            start_cast(tv, stream_url)
         else:
             devices = discover_devices(timeout=args.discover_timeout)
             tv = prompt_device(devices, args.device_name)
             print(f"[FluxCast] Found: {tv.cast_info.friendly_name}")
-            stream_server.allow_client(device_client_ip(tv, "cast"))
-            start_cast(tv, stream_url)
+        tv_ip = device_client_ip(tv, "cast")
+        serve_for(tv_ip)
+        stream_server.allow_client(tv_ip)
+        if not start_cast(tv, stream_url):
+            explain_and_exit()
 
     print("[FluxCast] Casting started. Press Ctrl+C to stop.")
-    signal.pause()
+    _watch_session(args, tv, tv_ip, lambda: host, ffmpeg_procs, transport_state, shutdown)
 
 
 if __name__ == "__main__":

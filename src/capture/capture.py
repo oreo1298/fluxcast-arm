@@ -503,11 +503,12 @@ def _start_capture_portal(
         print(f"[FluxCast] Capturing audio: {audio_monitor}")
 
     try:
+        # stderr stays visible: gst-launch -q prints only errors, and a
+        # pipeline that dies mid-cast was otherwise silent.
         gst_proc = subprocess.Popen(
             gst_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             pass_fds=(session.pw_fd,),
         )
     except FileNotFoundError as exc:
@@ -544,6 +545,7 @@ def _start_capture_x11grab(
         ffmpeg,
         "-hide_banner",
         "-loglevel", "warning",
+        "-nostats",
         "-y",
         "-thread_queue_size", "1024",
         "-f", "x11grab",
@@ -593,7 +595,8 @@ def _start_capture_x11grab(
         print(f"[FluxCast] Scaling output to : {out_res}")
 
     try:
-        process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Warnings and errors only (-loglevel warning -nostats), so keep them.
+        process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     except FileNotFoundError as exc:
         raise CaptureStartError(f"required executable not found: {exc}") from exc
 

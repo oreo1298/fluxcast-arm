@@ -1,9 +1,11 @@
 import sys
+import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     import pychromecast
+    from pychromecast.config import APP_MEDIA_RECEIVER
     from pychromecast.const import CAST_TYPE_CHROMECAST
     from pychromecast.discovery import discover_chromecasts
     from pychromecast.models import CastInfo, HostServiceInfo
@@ -134,18 +136,73 @@ def prompt_device(devices: list, device_name: Optional[str] = None):
         return devices[default_idx]
 
 
-def start_cast(device, stream_url: str) -> None:
-    device.wait()
+RECEIVER_LAUNCH_TIMEOUT = 20.0
+MEDIA_SESSION_TIMEOUT = 20.0
+
+
+def _wait_for_app(device, app_id: str, timeout: float,
+                  sleep: Callable[[float], None] = time.sleep) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if device.app_id == app_id:
+            return True
+        sleep(0.25)
+    return device.app_id == app_id
+
+
+def _launch_media_receiver(device, sleep: Callable[[float], None] = time.sleep) -> bool:
+    """Put Google's Default Media Receiver in front before sending LOAD.
+
+    pychromecast only launches it when the running app lacks the media
+    namespace. Apps that have it - a TV's own home screen or player, Spotify,
+    YouTube - receive the LOAD instead and ignore it, so the TV never asks for
+    the stream while FluxCast reported success (upstream #174).
+    """
+    if device.app_id == APP_MEDIA_RECEIVER:
+        return True
+    running = device.app_display_name or device.app_id or "nothing"
+    print(f"[FluxCast] Starting the TV's media receiver (currently running: {running})…")
+    try:
+        device.start_app(APP_MEDIA_RECEIVER, timeout=RECEIVER_LAUNCH_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - pychromecast raises several kinds
+        print(f"[FluxCast] WARNING: the TV did not confirm starting the media receiver "
+              f"({type(exc).__name__}: {exc}).")
+    if _wait_for_app(device, APP_MEDIA_RECEIVER, 10.0, sleep):
+        return True
+    print("[FluxCast] WARNING: the TV is still running "
+          f"{device.app_display_name or device.app_id or 'another app'}; the stream "
+          "may be ignored. Close other casting apps on the TV and try again.")
+    return False
+
+
+def start_cast(device, stream_url: str, sleep: Callable[[float], None] = time.sleep) -> bool:
+    """Load the stream on the TV. Returns True once a media session is active."""
+    try:
+        device.wait(timeout=15)
+    except pychromecast.RequestTimeout:
+        print(f"[FluxCast] ERROR: {device.cast_info.friendly_name} did not answer on its "
+              "Cast port within 15s.")
+        return False
     device.register_connection_listener(_ConnectionListener())
     mc = device.media_controller
     mc.register_status_listener(_MediaListener())
-    content_type = (
-        "application/x-mpegURL" if stream_url.endswith(".m3u8") else "video/mpeg"
-    )
-    mc.play_media(stream_url, content_type)
-    mc.block_until_active(timeout=15)
+    _launch_media_receiver(device, sleep)
+
+    is_hls = stream_url.endswith(".m3u8")
+    content_type = "application/x-mpegURL" if is_hls else "video/mpeg"
+    # The receiver's HLS player defaults vary between Cast implementations
+    # (Google TV, LG, Vizio); say outright that the segments are MPEG-TS.
+    media_info = {"hlsVideoSegmentFormat": "mpeg2_ts"} if is_hls else None
+    mc.play_media(stream_url, content_type, title="FluxCast", stream_type="LIVE",
+                  media_info=media_info)
+    mc.block_until_active(timeout=MEDIA_SESSION_TIMEOUT)
+    if not mc.session_active_event.is_set():
+        print(f"[FluxCast] ERROR: {device.cast_info.friendly_name} did not start a media "
+              f"session within {MEDIA_SESSION_TIMEOUT:.0f}s, so it did not accept the stream.")
+        return False
     print(f"[FluxCast] Cast started → {device.cast_info.friendly_name}")
     print("[FluxCast] Waiting for the TV to report playback status (watch lines below)…")
+    return True
 
 
 def stop_cast(device: Optional[object]) -> None:

@@ -31,6 +31,71 @@ TS_CONTENT_FEATURES = (
     "DLNA.ORG_CI=0;"
     f"DLNA.ORG_FLAGS={DLNA_FLAGS}"
 )
+# Content-Type of the progressive/live MPEG-TS bridges. LG webOS wants video/mpeg.
+TS_MIME = "video/mpeg"
+
+
+def set_dlna_ts_profile(mime: str, content_features: str) -> None:
+    """Label the MPEG-TS bridge the way the renderer was told in the DIDL.
+
+    DLNA expects the HTTP Content-Type and contentFeatures.dlna.org to match
+    the protocolInfo sent with SetAVTransportURI; dlna.choose_protocol_info
+    picks those from what the TV says it accepts.
+    """
+    global TS_MIME, TS_CONTENT_FEATURES
+    TS_MIME = mime
+    TS_CONTENT_FEATURES = content_features
+
+
+class RequestStats:
+    """What the TV actually fetched, so a silent failure can be explained.
+
+    "The TV never asked for the stream" (firewall, wrong address, isolated
+    Wi-Fi) and "it fetched it and gave up" (format) need opposite fixes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.requests = 0
+            self.bytes_sent = 0
+            self.first_request_at: Optional[float] = None
+            self.last_request_at: Optional[float] = None
+            self.rejected: dict[str, int] = {}
+
+    def served(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self.requests += 1
+            if self.first_request_at is None:
+                self.first_request_at = now
+            self.last_request_at = now
+
+    def sent(self, count: int) -> None:
+        with self._lock:
+            self.bytes_sent += count
+
+    def reject(self, client_ip: str) -> int:
+        """Count a refused request; returns how many this client has had."""
+        with self._lock:
+            self.rejected[client_ip] = self.rejected.get(client_ip, 0) + 1
+            return self.rejected[client_ip]
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "requests": self.requests,
+                "bytes_sent": self.bytes_sent,
+                "first_request_at": self.first_request_at,
+                "last_request_at": self.last_request_at,
+                "rejected": dict(self.rejected),
+            }
+
+
+request_stats = RequestStats()
 
 
 def new_session_id() -> str:
@@ -256,6 +321,10 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
     def _authorize(self) -> bool:
         allowed = getattr(self.server, "allowed_client", None)
         if not allowed or self.client_address[0] != allowed:
+            if request_stats.reject(self.client_address[0]) == 1 and allowed:
+                print(f"[FluxCast Server] Refusing {self.client_address[0]}: only the "
+                      f"selected TV ({allowed}) may fetch the stream. If that address "
+                      "is the TV's too, re-run with --host set to this computer's LAN IP.")
             self._send_empty(403)
             return False
 
@@ -266,6 +335,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
             if not path.startswith(prefix):
                 self._send_empty(404)
                 return False
+        request_stats.served()
         return True
 
     def _local_path(self) -> Optional[str]:
@@ -438,7 +508,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
         length = end - start + 1
         self.close_connection = True
         self.send_response(status)
-        self.send_header("Content-Type", "video/mpeg")
+        self.send_header("Content-Type", TS_MIME)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
@@ -508,6 +578,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(data)
                     self.wfile.flush()
                     sent += len(data)
+                    request_stats.sent(len(data))
                     last_segment = segment
 
                     if has_explicit_end and sent >= end - start + 1:
@@ -558,7 +629,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
         length = end - start + 1
         self.close_connection = True
         self.send_response(status)
-        self.send_header("Content-Type", "video/mpeg")
+        self.send_header("Content-Type", TS_MIME)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
@@ -574,7 +645,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
     def _send_progressive_range_error(self, current_size: int) -> None:
         self.close_connection = True
         self.send_response(416)
-        self.send_header("Content-Type", "video/mpeg")
+        self.send_header("Content-Type", TS_MIME)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Range", f"bytes */{current_size}")
         self.send_header("Content-Length", "0")
@@ -666,6 +737,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 sent += len(chunk)
+                request_stats.sent(len(chunk))
 
                 if has_explicit_end and sent >= total_length:
                     return
@@ -715,6 +787,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             if playlist_body is not None:
                 self.wfile.write(playlist_body[start:start + length])
+                request_stats.sent(length)
                 return
             with open(local_path, "rb") as file:
                 file.seek(start)
@@ -724,6 +797,7 @@ class HLSRequestHandler(http.server.BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+                    request_stats.sent(len(chunk))
                     remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -806,6 +880,7 @@ class StreamServer:
         except OSError:
             pass
         _progressive_ts.reset()
+        request_stats.reset()
         self._server = http.server.ThreadingHTTPServer(
             (self.host, self.port), self.handler_class
         )
