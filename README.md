@@ -12,6 +12,23 @@ FluxCast streams a Linux desktop to a TV.
 
 > 🌐 **Need a free subdomain for your project?** Check out [sub.fluxcast.dev](https://sub.fluxcast.dev) ([GitHub repo](https://github.com/IlyaP358/fluxcast-domains)), a free GitOps subdomain registry for developers!
 
+## Apple Silicon / Asahi Linux (this fork)
+
+This fork runs FluxCast on **Fedora Asahi Remix on Apple Silicon Macs** (M1/M2)
+and on any Fedora, with no third-party repositories required:
+
+```bash
+git clone https://github.com/oreo1298/fluxcast-arm.git
+cd fluxcast-arm
+./install-asahi.sh
+```
+
+It adds an OpenH264 fallback wherever FluxCast used x264 (stock Fedora has no
+x264), handles the missing hardware encoder on Apple Silicon, and adds a Fedora
+installer and Apple Silicon checks to `fluxcast --doctor`. Read
+**[ASAHI.md](ASAHI.md)** for the details, including how to check whether your
+Mac's Wi-Fi supports Wi-Fi Direct.
+
 ## Demo
 
 https://github.com/user-attachments/assets/0082972a-072a-4ad9-b37d-16150efc0291
@@ -137,6 +154,16 @@ desktop capture -> HTTP stream -> DLNA/UPnP AVTransport -> native TV player
 
 
 ## Installation
+
+### Fedora / Fedora Asahi Remix (Apple Silicon)
+
+```bash
+git clone https://github.com/oreo1298/fluxcast-arm.git
+cd fluxcast-arm
+./install-asahi.sh
+```
+
+See [ASAHI.md](ASAHI.md). `./uninstall-asahi.sh` removes it again.
 
 ### AppImage
 
