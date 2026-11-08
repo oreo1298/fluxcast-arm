@@ -1,0 +1,221 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          # only the indented app_info version, NOT the recipe's `version: 1`
+          sed -i -E "s/^([[:space:]]+)version:[[:space:]]*.*/\1version: $VERSION/" appimage/AppImageBuilder.yml
+          sed -i -E "s/^__installed_version__ = \".*\"/__installed_version__ = \"$VERSION\"/" src/version.py
+
+      - name: Build AppImage
+        run: bash appimage/build_appimage.sh
+
+      - name: Attach AppImage to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" appimage/FluxCast-*-x86_64.AppImage --clobber
+
+  deb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # One .deb per release. The package ships a virtualenv whose wheels are
+        # ABI-tagged for the build host's Python minor version, so a single
+        # artifact cannot cover them all - debian/rules pins each build to its
+        # own python3 so apt refuses a mismatched install rather than
+        # installing something that fails on first import.
+        #
+        # Scope is Ubuntu LTS and Debian stable, for as long as each has
+        # upstream support; an entry is dropped once that ends. Ubuntu interim
+        # releases are deliberately absent - one arrives every six months and
+        # lives nine, so including them would mean permanent churn here for
+        # users the python3 bound already reaches (a release shares a build
+        # with whichever entry carries the same python3 minor).
+        #
+        # Tags are pinned to explicit versions, not rolling aliases like
+        # debian:stable, so a release entering or leaving the matrix is always
+        # a visible change here rather than something that happens on its own
+        # when Debian promotes a new stable.
+        #
+        # Support ends (approximate): Debian 12 mid-2028 with LTS, Debian 13
+        # mid-2030 with LTS, Ubuntu 24.04 June 2029, Ubuntu 26.04 April 2031.
+        image:
+          - debian:12      # bookworm, python 3.11
+          - debian:13      # trixie,   python 3.13
+          - ubuntu:24.04   # noble,    python 3.12
+          - ubuntu:26.04   # resolute, python 3.14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          sed -i -E "s/^__installed_version__ = \".*\"/__installed_version__ = \"$VERSION\"/" src/version.py
+          sed -i -E "1s/^fluxcast \([^)]*\)/fluxcast ($VERSION)/" debian/changelog
+
+      - name: Build .deb on ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD":/work -w /work ${{ matrix.image }} bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+              debhelper devscripts build-essential \
+              python3 python3-venv python3-pip ca-certificates
+            CODENAME=$(. /etc/os-release; echo $VERSION_CODENAME)
+            sed -i -E "1s/^fluxcast \(([^)]*)\)/fluxcast (\1~$CODENAME)/" debian/changelog
+            dpkg-buildpackage -b -us -uc
+            cp /fluxcast_*.deb /work/
+          '
+
+      - name: Attach .deb to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" fluxcast_*_amd64.deb --clobber
+
+  pypi:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          sed -i -E "s/^__installed_version__ = \".*\"/__installed_version__ = \"$VERSION\"/" src/version.py
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  aur:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set pkgver from tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i -E "s/^pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
+          sed -i -E "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+
+      - name: Publish to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: fluxcast
+          asset_dir: aur
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: ${{ github.event.release.tag_name }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+          updpkgsums: true
+          test: true
+
+  apt:
+    needs: deb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends apt-utils gnupg rsync
+
+      - name: Download this release's .deb files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p incoming
+          gh release download "$TAG" --dir incoming --pattern 'fluxcast_*_amd64.deb'
+          ls -l incoming
+
+      - name: Import the signing key
+        env:
+          KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: printf '%s\n' "$KEY" | gpg --batch --quiet --import
+
+      - name: Prepare ssh
+        env:
+          SSH_KEY: ${{ secrets.APT_SSH_KEY }}
+          HOST: ${{ secrets.APT_SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          ssh-keyscan -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Fetch the pool that is already published
+        env:
+          HOST: ${{ secrets.APT_SSH_HOST }}
+          USER: ${{ secrets.APT_SSH_USER }}
+        run: |
+          mkdir -p repo/pool
+          rsync -a -e "ssh -i $HOME/.ssh/deploy" \
+            "$USER@$HOST:/var/www/apt/pool/" repo/pool/ \
+            || echo "nothing published yet, starting a fresh pool"
+
+      - name: Build and sign the repository
+        env:
+          KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: bash meta/apt/build-repo.sh
+
+      - name: Build fluxcast-repo.deb
+        run: bash meta/apt/build-config-package.sh
+
+      - name: Publish
+        env:
+          HOST: ${{ secrets.APT_SSH_HOST }}
+          USER: ${{ secrets.APT_SSH_USER }}
+        run: |
+          # dists/ is replaced wholesale so stale indices cannot linger, while
+          # pool/ only ever grows, which is what keeps older versions available.
+          rsync -a --delete -e "ssh -i $HOME/.ssh/deploy" \
+            repo/dists/ "$USER@$HOST:/var/www/apt/dists/"
+          rsync -a -e "ssh -i $HOME/.ssh/deploy" \
+            repo/pool/ "$USER@$HOST:/var/www/apt/pool/"
+          rsync -a -e "ssh -i $HOME/.ssh/deploy" \
+            repo/fluxcast-repo.deb repo/fluxcast-archive-keyring.gpg \
+            "$USER@$HOST:/var/www/apt/"

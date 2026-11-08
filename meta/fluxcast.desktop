@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=FluxCast
+Comment=Stream your desktop to a Smart TV
+Exec=fluxcast --tray
+Icon=fluxcast
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Network;
+Keywords=cast;stream;miracast;screen;tv;wireless;dlna;chromecast;

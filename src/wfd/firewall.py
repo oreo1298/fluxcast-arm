@@ -1,0 +1,128 @@
+import subprocess
+from typing import Sequence
+
+from diagnostics import _firewalld_active, _ufw_enabled
+
+from .proc import _run
+
+
+# firewalld gates every firewall-cmd call through Polkit, read-only queries
+# included, so on some hosts `--query-port` blocks until the user answers a
+# dialog. Give it the same budget as `--add-port` rather than a 3 s probe.
+_FIREWALL_AUTH_TIMEOUT = 60.0
+
+_WFD_FIREWALL_ZONE = "nm-shared"
+
+def _print_firewall_manual_hint(port: int, reason: str) -> None:
+    print(
+        f"[FluxCast WFD] Could not open firewalld port {port}/tcp automatically "
+        f"({reason}).\n"
+        "  Open it once yourself, then re-run FluxCast:\n"
+        f"    sudo firewall-cmd --permanent --zone={_WFD_FIREWALL_ZONE} --add-port={port}/tcp "
+        "&& sudo firewall-cmd --reload\n"
+        "  or pass --wfd-no-firewall if you manage the firewall yourself."
+    )
+
+def _warn_if_ufw_may_block(ports: Sequence[tuple[int, str]]) -> None:
+    """Say something before the session hangs on a ufw host.
+
+    FluxCast cannot open the port itself here: ufw has no Polkit integration
+    to prompt through the way firewalld does, so this would mean shelling out
+    to sudo mid-session to edit the user's firewall. Printing the command is
+    the honest limit (#98).
+
+    Takes every port the session listens on, and is called once with all of
+    them. Living inside _open_wfd_firewall_port meant it printed once per
+    call, so --wfd-uibc produced a second copy that described 7239 as the
+    port the sink's RTSP connection arrives on. Each port now says what it
+    is instead.
+
+    Deliberately file-only - no subprocess. The firewall probe runs on the
+    connect path, and a blocking call here was already a problem once (#114).
+    """
+    # With firewalld running we open the ports ourselves; ufw is not in play.
+    if _firewalld_active():
+        return
+    if _ufw_enabled() is not True:
+        return
+    if not ports:
+        return
+
+    allow = "\n".join(f"    sudo ufw allow {port}/tcp    # {label}"
+                      for port, label in ports)
+    listens_on = "the port" if len(ports) == 1 else "the ports"
+    print(
+        "[FluxCast WFD] ufw is enabled. If the sink never opens its RTSP "
+        f"connection, allow {listens_on} FluxCast listens on:\n"
+        f"{allow}\n"
+        "  or pass --wfd-no-firewall to silence this."
+    )
+
+def _open_wfd_firewall_port(port: int) -> bool:
+    """
+    Runtime-only (no ``--permanent``): cleared on reload/reboot, and removed on
+    exit. Returns True only if WE opened it, so the caller knows to undo it; a
+    port the user already had open is left untouched.
+    """
+    # None ("couldn't ask systemd") is treated like inactive: nothing to open.
+    # The ufw hint for this case is printed once per session by the caller,
+    # not here - see _warn_if_ufw_may_block.
+    if not _firewalld_active():
+        return False
+
+    # Polkit can gate the read-only query as well, so it gets the same budget
+    # as the --add-port it precedes (#114).
+    try:
+        query = _run(
+            [
+                "firewall-cmd",
+                f"--zone={_WFD_FIREWALL_ZONE}",
+                f"--query-port={port}/tcp",
+            ],
+            timeout=_FIREWALL_AUTH_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _print_firewall_manual_hint(port, f"could not check existing rule: {exc}")
+        return False
+
+    # A real query result is the literal ``yes``/``no`` output. Authorization
+    # failures can use the same non-zero status as a closed port, so do not
+    # infer the result from the return code alone.
+    query_status = query.stdout.strip().lower()
+    query_output = (query.stdout + query.stderr).strip()
+    if query_status == "yes":
+        return False  # The user already had it open; leave it untouched.
+    if query_status != "no":
+        _print_firewall_manual_hint(
+            port,
+            query_output or "firewall-cmd could not verify the existing rule",
+        )
+        return False
+
+    print(f"[FluxCast WFD] Opening firewalld port {port}/tcp ({_WFD_FIREWALL_ZONE} zone) "
+          "for this session; approve the authorization prompt if one appears.")
+    try:
+        result = _run(["firewall-cmd", f"--zone={_WFD_FIREWALL_ZONE}",
+                       f"--add-port={port}/tcp"],
+                      timeout=_FIREWALL_AUTH_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _print_firewall_manual_hint(port, f"authorization did not complete: {exc}")
+        return False
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        _print_firewall_manual_hint(port, output.strip() or "firewall-cmd refused the request")
+        return False
+    if "ALREADY_ENABLED" in output.upper():
+        return False  # user already had it open; leave it exactly as-is
+    print(f"[FluxCast WFD] Opened firewalld port {port}/tcp for this session "
+          "(removed on exit).")
+    return True
+
+def _close_wfd_firewall_port(port: int) -> None:
+    """Undo _open_wfd_firewall_port (best-effort)."""
+    try:
+        _run(["firewall-cmd", f"--zone={_WFD_FIREWALL_ZONE}",
+              f"--remove-port={port}/tcp"], timeout=15.0)
+        print(f"[FluxCast WFD] Closed firewalld port {port}/tcp.")
+    except (OSError, subprocess.TimeoutExpired):
+        pass

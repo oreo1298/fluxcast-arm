@@ -1,0 +1,1078 @@
+import json
+import importlib.util
+import ipaddress
+import grp
+import os
+import platform
+import re
+import shutil
+import subprocess
+from dataclasses import asdict, dataclass
+from typing import Optional
+
+# Admin groups that may receive the FluxCast wpa_supplicant Properties.Set grant.
+# wheel: Arch/Fedora; sudo: Debian/Ubuntu. Desktop users who can already elevate
+# are typically in one of these.
+WPA_DBUS_ADMIN_GROUPS = ("wheel", "sudo")
+
+
+STATUS_OK = "ok"
+STATUS_WARN = "warn"
+STATUS_FAIL = "fail"
+STATUS_SKIP = "skip"
+
+_GST_BASE_PACKAGES = ("gstreamer1.0-plugins-base (Arch: gst-plugins-base; "
+                      "Fedora: gstreamer1-plugins-base)")
+_GST_GOOD_PACKAGES = ("gstreamer1.0-plugins-good (Arch: gst-plugins-good; "
+                      "Fedora: gstreamer1-plugins-good)")
+_GST_BAD_PACKAGES = ("gstreamer1.0-plugins-bad (Arch: gst-plugins-bad; "
+                     "Fedora: gstreamer1-plugins-bad-free)")
+
+# Elements the portal GStreamer backend links. wfd/media/portal.py imports these
+# rather than keeping its own copy: --doctor vouched for two of them while the
+# backend enforced twelve, so a user could install exactly what the report named
+# and still not start a session (#129). wfd imports diagnostics and never the
+# reverse, so the shared copy lives on this side.
+PORTAL_GST_VIDEO_ELEMENTS = (
+    "pipewiresrc", "videoconvert", "videoscale", "videorate", "imagefreeze",
+    "x264enc", "mpegtsmux", "rtpmp2tpay", "udpsink",
+)
+PORTAL_GST_AUDIO_ELEMENTS = (
+    "pulsesrc", "audioconvert", "audioresample", "aacparse",
+)
+# Tried in this order by _gst_pick_aac_encoder, which needs exactly one of them.
+PORTAL_GST_AAC_ENCODERS = ("fdkaacenc", "avenc_aac", "voaacenc", "faac")
+
+# What to install when an element is absent. Read off the apt indexes'
+# Gstreamer-Elements fields on Ubuntu 26.04 with GStreamer 1.28, because the
+# grouping is not guessable: fdkaacenc has a package of its own rather than
+# sitting in -plugins-bad, and faac is not packaged for Debian/Ubuntu at all.
+_GST_ELEMENT_PACKAGES = {
+    "pipewiresrc": "gstreamer1.0-pipewire (Arch: gst-plugin-pipewire; "
+                   "Fedora: pipewire-gstreamer)",
+    "videoconvert": _GST_BASE_PACKAGES,
+    "videoscale": _GST_BASE_PACKAGES,
+    "videorate": _GST_BASE_PACKAGES,
+    "audioconvert": _GST_BASE_PACKAGES,
+    "audioresample": _GST_BASE_PACKAGES,
+    "imagefreeze": _GST_GOOD_PACKAGES,
+    "rtpmp2tpay": _GST_GOOD_PACKAGES,
+    "udpsink": _GST_GOOD_PACKAGES,
+    "pulsesrc": _GST_GOOD_PACKAGES,
+    "aacparse": _GST_GOOD_PACKAGES,
+    "mpegtsmux": _GST_BAD_PACKAGES,
+    "voaacenc": _GST_BAD_PACKAGES,
+    "x264enc": "gstreamer1.0-plugins-ugly (Arch: gst-plugins-ugly; "
+               "Fedora: gstreamer1-plugins-ugly, RPM Fusion)",
+    "avenc_aac": "gstreamer1.0-libav (Arch: gst-libav; "
+                 "Fedora: gstreamer1-libav, RPM Fusion)",
+    "fdkaacenc": "gstreamer1.0-fdkaac (Arch: gst-plugins-bad; "
+                 "Fedora: gstreamer1-plugins-bad-free)",
+    "faac": "not packaged for Debian/Ubuntu (Arch: gst-plugins-bad)",
+}
+
+
+# RTSP port advertised in the WFD IEs; must reach the receiver for streaming.
+WFD_RTSP_PORT = 7236
+
+# NetworkManager brings Wi-Fi Direct (P2P) groups up on this hardcoded subnet.
+# An existing LAN/VPN/docker interface that overlaps it breaks the P2P session
+# in a way that is hard to diagnose, so --doctor surfaces the clash.
+WFD_P2P_SUBNET = "192.168.49.0/24"
+
+# Prefix of the `iw P2P` warning raised for stale Wi-Fi Direct group
+# interfaces. run_diagnostics matches on it so such a row still counts as proof
+# the kernel exposes Wi-Fi Direct (see _p2p_row_is_evidence).
+_LEFTOVER_GROUP_MSG = "stale Wi-Fi Direct"
+
+
+@dataclass
+class Check:
+    name: str
+    status: str
+    message: str
+    detail: str = ""
+
+
+@dataclass
+class DiagnosticReport:
+    checks: list[Check]
+    wfd_candidate: bool
+    summary: str
+
+    def to_dict(self) -> dict:
+        return {
+            "checks": [asdict(check) for check in self.checks],
+            "wfd_candidate": self.wfd_candidate,
+            "summary": self.summary,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
+
+
+def _run(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+# iw and wpa_cli install to /usr/sbin, which is not on a normal user's PATH on
+# Debian and Ubuntu (on Arch it is a symlink to /usr/bin). Look there too.
+IW_PATHS = ["/usr/sbin/iw", "/sbin/iw"]
+WPA_CLI_PATHS = ["/usr/sbin/wpa_cli", "/sbin/wpa_cli"]
+
+
+def _find_binary(binary: str, extra_paths: Optional[list[str]] = None) -> Optional[str]:
+    path = shutil.which(binary)
+    if path:
+        return path
+    for candidate in extra_paths or []:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _command_check(
+    binary: str,
+    purpose: str,
+    required: bool = False,
+    extra_paths: Optional[list[str]] = None,
+) -> Check:
+    path = _find_binary(binary, extra_paths=extra_paths)
+    if path:
+        return Check(binary, STATUS_OK, purpose, path)
+
+    status = STATUS_FAIL if required else STATUS_WARN
+    return Check(binary, status, purpose, "not found in PATH")
+
+
+def _wf_recorder_check() -> Check:
+    # Deferred: wfd/__init__.py imports diagnostics; a top-level import cycles.
+    from wfd.wf_recorder import find_wf_recorder
+
+    path = shutil.which("wf-recorder")
+    if not path:
+        return Check(
+            "wf-recorder", STATUS_WARN, "Wayland/wlroots screen capture",
+            "not found in PATH; install wf-recorder",
+        )
+    if find_wf_recorder():
+        return Check("wf-recorder", STATUS_OK, "Wayland/wlroots screen capture", path)
+    return Check(
+        "wf-recorder", STATUS_WARN,
+        "wf-recorder was found but could not be executed",
+        "the AppImage wrapper needs the system wf-recorder package; install wf-recorder",
+    )
+
+
+# Stands in for "any one of PORTAL_GST_AAC_ENCODERS" in the missing list.
+_AAC_ENCODER_LABEL = "an AAC encoder"
+
+
+def _gst_element_present(gst_inspect: str, element: str) -> Optional[bool]:
+    """Whether gst-inspect-1.0 can see the element. None means it could not say."""
+    try:
+        result = _run([gst_inspect, element], timeout=5.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.returncode == 0
+
+
+def _gst_install_hint(elements: list[str]) -> str:
+    """Name what to install, grouped so one package is named once."""
+    by_package: dict[str, list[str]] = {}
+    for element in elements:
+        if element == _AAC_ENCODER_LABEL:
+            package = (f"any of {', '.join(PORTAL_GST_AAC_ENCODERS)} - "
+                       f"{_GST_ELEMENT_PACKAGES['avenc_aac']} is the most widely available")
+        else:
+            package = _GST_ELEMENT_PACKAGES.get(element, "unknown package")
+        by_package.setdefault(package, []).append(element)
+    return "; ".join(f"{', '.join(names)}: install {package}"
+                     for package, names in by_package.items())
+
+
+def _portal_gst_elements_check(no_audio: bool = False) -> Check:
+    """Check every element the portal backend enforces, not a hand-picked pair.
+
+    The backend preflight reads the same tuples from this module, so the report
+    and the runtime requirement cannot drift apart again (#129). The AAC encoder
+    counts as one requirement satisfied by any of several elements, which is how
+    _gst_pick_aac_encoder resolves it.
+    """
+    name = "portal gst elements"
+    required = list(PORTAL_GST_VIDEO_ELEMENTS)
+    if not no_audio:
+        required += list(PORTAL_GST_AUDIO_ELEMENTS)
+    total = len(required) + (0 if no_audio else 1)
+
+    gst_inspect = shutil.which("gst-inspect-1.0")
+    if not gst_inspect:
+        return Check(
+            name, STATUS_WARN,
+            f"none of the {total} elements the portal backend needs could be verified",
+            "gst-inspect-1.0 not found; install gstreamer1.0-tools "
+            "(Arch: gstreamer; Fedora: gstreamer1-plugins-base-tools)",
+        )
+
+    missing: list[str] = []
+    unverified: list[str] = []
+    for element in required:
+        present = _gst_element_present(gst_inspect, element)
+        if present is None:
+            unverified.append(element)
+        elif not present:
+            missing.append(element)
+
+    chosen_encoder = ""
+    if not no_audio:
+        for encoder in PORTAL_GST_AAC_ENCODERS:
+            if _gst_element_present(gst_inspect, encoder):
+                chosen_encoder = encoder
+                break
+        else:
+            missing.append(_AAC_ENCODER_LABEL)
+
+    if missing:
+        detail = _gst_install_hint(missing)
+        if unverified:
+            detail += f"; could not verify {', '.join(unverified)}"
+        return Check(
+            name, STATUS_WARN,
+            f"portal backend is missing {len(missing)} of {total}: "
+            + ", ".join(missing),
+            detail,
+        )
+
+    if unverified:
+        return Check(
+            name, STATUS_WARN,
+            f"could not verify {len(unverified)} of {total}: "
+            + ", ".join(unverified),
+            "gst-inspect-1.0 did not answer; the portal backend may still fail to start",
+        )
+
+    detail = f"{total} of {total} present"
+    if chosen_encoder:
+        detail += f"; AAC encoder: {chosen_encoder}"
+    return Check(name, STATUS_OK, "Wayland portal GStreamer pipeline", detail)
+
+
+
+def _first_matching_command(commands: list[str]) -> Optional[str]:
+    for command in commands:
+        if shutil.which(command):
+            return command
+    return None
+
+
+def _python_module_check(module: str, purpose: str, required: bool = False) -> Check:
+    if importlib.util.find_spec(module) is not None:
+        return Check(module, STATUS_OK, purpose, "python module is installed")
+    status = STATUS_FAIL if required else STATUS_WARN
+    return Check(
+        module,
+        status,
+        purpose,
+        "python module is missing; install with pip",
+    )
+
+
+def _ffmpeg_encoders() -> Check:
+    ffmpeg = _first_matching_command(["ffmpeg", "/usr/sbin/ffmpeg"])
+    if not ffmpeg:
+        return Check("ffmpeg encoders", STATUS_FAIL, "ffmpeg is required", "not found")
+
+    try:
+        result = _run([ffmpeg, "-hide_banner", "-encoders"], timeout=5.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("ffmpeg encoders", STATUS_FAIL, "could not query ffmpeg encoders", str(exc))
+
+    encoders = result.stdout + result.stderr
+    h264_candidates = [
+        "libx264",
+        "h264_vaapi",
+        "h264_nvenc",
+        "h264_qsv",
+        "h264_v4l2m2m",
+    ]
+    found_h264 = [name for name in h264_candidates if name in encoders]
+    found_aac = " aac " in encoders or "\naac " in encoders or "libfdk_aac" in encoders
+
+    if found_h264 and found_aac:
+        return Check(
+            "ffmpeg encoders",
+            STATUS_OK,
+            "H.264 and AAC encoders are available",
+            f"h264={', '.join(found_h264)}; aac=yes",
+        )
+    if found_h264:
+        return Check(
+            "ffmpeg encoders",
+            STATUS_WARN,
+            "H.264 encoder is available, AAC encoder was not detected",
+            f"h264={', '.join(found_h264)}; aac=no",
+        )
+    return Check(
+        "ffmpeg encoders",
+        STATUS_FAIL,
+        "no usable H.264 encoder detected",
+        "need libx264 or a hardware H.264 encoder",
+    )
+
+
+_PORTAL_BACKENDS = [
+    "xdg-desktop-portal-hyprland",
+    "xdg-desktop-portal-kde",
+    "xdg-desktop-portal-gnome",
+    "xdg-desktop-portal-wlr",
+    "xdg-desktop-portal-lxqt",
+    "xdg-desktop-portal-cosmic",
+]
+
+
+def _portal_process_check() -> Check:
+    """Check whether xdg-desktop-portal and a backend are actually running."""
+
+    def _pgrep(name: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", name],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    running_backend = next((b for b in _PORTAL_BACKENDS if _pgrep(b)), None)
+    if running_backend:
+        return Check(
+            "xdg-desktop-portal",
+            STATUS_OK,
+            "Wayland portal stack is running",
+            running_backend,
+        )
+
+    if _pgrep("xdg-desktop-portal"):
+        return Check(
+            "xdg-desktop-portal",
+            STATUS_WARN,
+            "portal daemon running but no backend process detected",
+            "is a portal backend installed and enabled?",
+        )
+
+    return Check(
+        "xdg-desktop-portal",
+        STATUS_WARN,
+        "portal daemon not running",
+        "not needed for wf-recorder (Hyprland/Sway); required for GNOME/KDE capture",
+    )
+
+
+def _display_capture_check() -> Check:
+    # Deferred: wfd/__init__.py imports diagnostics; a top-level import cycles.
+    from wfd.wf_recorder import find_wf_recorder
+
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+    x11 = os.environ.get("DISPLAY")
+    wf_recorder = find_wf_recorder()
+    xrandr = shutil.which("xrandr")
+    portal = _find_binary(
+        "xdg-desktop-portal",
+        extra_paths=["/usr/libexec/xdg-desktop-portal", "/usr/lib/xdg-desktop-portal"],
+    )
+    portal_kde = _find_binary(
+        "xdg-desktop-portal-kde",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-kde", "/usr/lib/xdg-desktop-portal-kde"],
+    )
+    portal_gnome = _find_binary(
+        "xdg-desktop-portal-gnome",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-gnome", "/usr/lib/xdg-desktop-portal-gnome"],
+    )
+    portal_wlr = _find_binary(
+        "xdg-desktop-portal-wlr",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-wlr", "/usr/lib/xdg-desktop-portal-wlr"],
+    )
+    portal_hyprland = _find_binary(
+        "xdg-desktop-portal-hyprland",
+        extra_paths=["/usr/libexec/xdg-desktop-portal-hyprland", "/usr/lib/xdg-desktop-portal-hyprland"],
+    )
+
+    if wayland and wf_recorder:
+        return Check(
+            "screen capture",
+            STATUS_OK,
+            "Wayland capture path is available",
+            f"WAYLAND_DISPLAY={wayland}; wf-recorder={wf_recorder}",
+        )
+    if wayland and portal and (portal_kde or portal_gnome or portal_wlr or portal_hyprland):
+        backend = portal_kde or portal_gnome or portal_wlr or portal_hyprland
+        return Check(
+            "screen capture",
+            STATUS_OK,
+            "Wayland portal stack is available",
+            f"WAYLAND_DISPLAY={wayland}; portal={portal}; backend={backend}",
+        )
+    if x11 and xrandr:
+        return Check(
+            "screen capture",
+            STATUS_OK,
+            "X11 capture path is available",
+            f"DISPLAY={x11}; xrandr={xrandr}",
+        )
+    if wayland:
+        detail = "Install wf-recorder or xdg-desktop-portal + desktop-specific backend."
+        if not portal:
+            detail = "xdg-desktop-portal not found; install portal stack for KDE/GNOME capture."
+        return Check(
+            "screen capture",
+            STATUS_WARN,
+            "Wayland detected, but capture backend is incomplete",
+            detail,
+        )
+    if x11:
+        return Check(
+            "screen capture",
+            STATUS_WARN,
+            "X11 detected, but xrandr is missing",
+            "monitor detection may fail",
+        )
+    return Check(
+        "screen capture",
+        STATUS_WARN,
+        "no active WAYLAND_DISPLAY or DISPLAY detected",
+        "run from the graphical desktop session",
+    )
+
+
+def _audio_check() -> Check:
+    pactl = shutil.which("pactl")
+    if not pactl:
+        return Check("audio capture", STATUS_WARN, "pactl was not found", "audio monitor auto-detect may fail")
+
+    try:
+        result = _run([pactl, "get-default-sink"], timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("audio capture", STATUS_WARN, "could not query default audio sink", str(exc))
+
+    sink = result.stdout.strip()
+    if result.returncode == 0 and sink:
+        return Check("audio capture", STATUS_OK, "default audio monitor can be derived", sink + ".monitor")
+    return Check("audio capture", STATUS_WARN, "default audio sink was not reported", result.stderr.strip())
+
+
+def _nmcli_check() -> Check:
+    if not shutil.which("nmcli"):
+        return Check("NetworkManager", STATUS_WARN, "nmcli was not found", "Miracast P2P usually needs NetworkManager")
+
+    try:
+        version = _run(["nmcli", "--version"], timeout=2.0)
+        devices = _run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("NetworkManager", STATUS_WARN, "could not query NetworkManager", str(exc))
+
+    output = devices.stdout.strip()
+    has_wifi = any(":wifi:" in line for line in output.splitlines())
+    has_p2p = any("p2p" in line.lower() for line in output.splitlines())
+    detail = "; ".join(part for part in [version.stdout.strip(), output] if part)
+    if has_wifi and has_p2p:
+        return Check("NetworkManager", STATUS_OK, "Wi-Fi and P2P devices are visible", detail)
+    if has_wifi:
+        return Check("NetworkManager", STATUS_WARN, "Wi-Fi is visible, but no P2P device was listed", detail)
+    return Check("NetworkManager", STATUS_WARN, "no Wi-Fi device was listed by NetworkManager", detail)
+
+
+def _iw_phy_p2p_facts() -> tuple[Optional[bool], Optional[bool]]:
+    """
+    Gets P2P capability and STA/P2P concurrency via `iw phy` (no root).
+    Returns (bool/None, bool/None); both are None if parsing fails.
+    """
+    iw = _find_binary("iw", IW_PATHS)
+    if not iw:
+        return (None, None)
+    try:
+        result = _run([iw, "phy"], timeout=4.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return (None, None)
+    if result.returncode != 0:
+        return (None, None)
+    text = result.stdout
+
+    p2p_capable = bool(re.search(r"P2P-(client|GO|device)", text))
+
+    # Capture the "valid interface combinations:" block: lines indented deeper
+    # than the header, until the section ends.
+    combo_lines: list[str] = []
+    capturing = False
+    header_indent = 0
+    for line in text.splitlines():
+        if "valid interface combinations:" in line:
+            capturing = True
+            header_indent = len(line) - len(line.lstrip())
+            continue
+        if capturing:
+            if not line.strip():
+                continue
+            if (len(line) - len(line.lstrip())) <= header_indent:
+                break
+            combo_lines.append(line)
+    # Each combination is a '*'-led entry (may wrap onto continuation lines).
+    # Concurrent if a single entry allows both a managed and a P2P interface.
+    concurrent = any(
+        "managed" in chunk and re.search(r"P2P-(client|GO|device)", chunk)
+        for chunk in "\n".join(combo_lines).split("*")
+    )
+    return (p2p_capable, concurrent)
+
+
+def _iw_p2p_group_interfaces(output: str) -> list[tuple[str, str]]:
+    """(name, kind) of every P2P group netdev in `iw dev` output.
+
+    The adapter's own control interface shows up as `type P2P-device` once the
+    driver supports P2P, and is expected whenever hardware is ready. A
+    `P2P-client` or `P2P-GO` netdev only exists while a Wi-Fi Direct group is
+    up, so one present while --doctor runs (before a session starts) is left
+    over from an earlier interrupted session (#166). Every such interface is
+    returned with its kind so the advice can name each one and describe it by
+    the role it played (group owner vs. client).
+    """
+    groups: list[tuple[str, str]] = []
+    current: Optional[str] = None
+    for line in output.splitlines():
+        interface = re.match(r"\s*Interface\s+(\S+)", line)
+        if interface:
+            current = interface.group(1)
+            continue
+        kind = re.match(r"\s*type\s+(P2P-client|P2P-GO)\b", line)
+        if current and kind:
+            groups.append((current, kind.group(1)))
+    return groups
+
+
+def _iw_p2p_check() -> Check:
+    iw = _find_binary("iw", IW_PATHS)
+    if not iw:
+        return Check("iw P2P", STATUS_WARN, "iw was not found", "cannot inspect kernel Wi-Fi interfaces")
+
+    try:
+        result = _run([iw, "dev"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("iw P2P", STATUS_WARN, "could not query iw dev", str(exc))
+
+    output = result.stdout.strip()
+    if result.returncode != 0:
+        return Check("iw P2P", STATUS_WARN, "iw dev failed", result.stderr.strip())
+
+    # Any leftover group interface means the adapter is still (or looks)
+    # attached to a group from a previous session; report it before the
+    # P2P-device check below, which would otherwise call the whole row ok.
+    # --doctor cannot tell a live session's group netdev from a stale one, so
+    # the advice gates the removal on no cast running rather than guessing.
+    leftover = _iw_p2p_group_interfaces(output)
+    if leftover:
+        names = [name for name, _ in leftover]
+        kinds = {kind for _, kind in leftover}
+        # #127's leftovers are all group owners; describe the netdevs by the
+        # role they played so the advice stays accurate for a stale group owner
+        # or a stale client alike.
+        if kinds == {"P2P-GO"}:
+            role = "group-owner"
+        elif kinds == {"P2P-client"}:
+            role = "client"
+        else:
+            role = "group-owner/client"
+        plural = len(names) > 1
+        listing = ", ".join(names)
+        # print_report flattens newlines to " | ", so the advice has to be one
+        # line; the interface names already appear in the message, so they are
+        # not repeated here. One removal command per interface, semicolon-
+        # joined: removing only the first leaves the rest behind and the next
+        # --doctor reports them again. The raw dump below keeps its own lines
+        # and renders the same way the ok branch always has.
+        removals = "; ".join(f"sudo iw dev {name} del" for name in names)
+        return Check(
+            "iw P2P", STATUS_WARN,
+            f"{_LEFTOVER_GROUP_MSG} {role} interface{'s' if plural else ''} "
+            f"left over from a previous session: {listing}",
+            f"{'These are stale' if plural else 'This is a stale'} {role} "
+            f"interface{'s' if plural else ''} left over from a previous "
+            f"session, which keeps the adapter attached to a Wi-Fi Direct group "
+            f"that no longer exists. If no cast is running right now, remove "
+            f"{'them' if plural else 'it'} before starting a new session: "
+            f"{removals}\n\nRaw `iw dev` output:\n{output}",
+        )
+
+    if re.search(r"\btype\s+P2P-device\b", output):
+        return Check("iw P2P", STATUS_OK, "kernel exposes a P2P-device interface", output)
+    if "Interface" in output:
+        # No P2P-device instance: explain why and what to do, using the adapter's
+        # advertised capability instead of a bare "no P2P-device shown".
+        p2p_capable, concurrent = _iw_phy_p2p_facts()
+        if p2p_capable is False:
+            return Check(
+                "iw P2P", STATUS_WARN,
+                "this Wi-Fi adapter's driver does not support Wi-Fi Direct (P2P)",
+                "WFD needs a P2P-capable adapter (most internal Wi-Fi, or a P2P-capable "
+                "USB dongle).",
+            )
+        if concurrent is False:
+            return Check(
+                "iw P2P", STATUS_WARN,
+                "this adapter can't run a Wi-Fi connection and Wi-Fi Direct at the same time",
+                "disconnect Wi-Fi before starting WFD (keep Ethernet for internet), or use an "
+                "adapter whose driver supports concurrent STA + P2P.",
+            )
+        return Check("iw P2P", STATUS_WARN, "Wi-Fi interfaces exist, but no P2P-device was shown", output)
+    return Check("iw P2P", STATUS_WARN, "no Wi-Fi interfaces were shown", output)
+
+
+def _subnet_conflict_check() -> Check:
+    """Warn when an existing interface overlaps the Wi-Fi Direct P2P subnet.
+
+    NetworkManager provisions Wi-Fi Direct groups on WFD_P2P_SUBNET. If a LAN,
+    VPN, or docker interface already occupies that range, the P2P session fails
+    in a way that is hard to diagnose, so surface the overlap here. This is a
+    read-only check; it never changes any interface.
+    """
+    name = "P2P subnet"
+    if not shutil.which("ip"):
+        return Check(name, STATUS_SKIP, "ip was not found", "cannot inspect interface addresses")
+
+    try:
+        result = _run(["ip", "-j", "addr"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check(name, STATUS_WARN, "could not query interface addresses", str(exc))
+
+    if result.returncode != 0:
+        return Check(name, STATUS_WARN, "ip addr query failed", (result.stderr or "").strip())
+
+    try:
+        interfaces = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        return Check(name, STATUS_WARN, "could not parse ip addr output", str(exc))
+
+    p2p_net = ipaddress.ip_network(WFD_P2P_SUBNET)
+    conflicts = []
+    for iface in interfaces:
+        dev = iface.get("ifname", "?")
+        # Wi-Fi Direct interfaces are expected to live on this subnet; a clash is
+        # only meaningful when some *other* interface already occupies the range.
+        if "p2p" in dev.lower():
+            continue
+        for addr in iface.get("addr_info", []):
+            if addr.get("family") != "inet":
+                continue
+            local, prefixlen = addr.get("local"), addr.get("prefixlen")
+            if local is None or prefixlen is None:
+                continue
+            try:
+                net = ipaddress.ip_network(f"{local}/{prefixlen}", strict=False)
+            except ValueError:
+                continue
+            if net.overlaps(p2p_net):
+                conflicts.append(f"{dev}={local}/{prefixlen}")
+
+    if conflicts:
+        return Check(
+            name,
+            STATUS_WARN,
+            f"an existing interface overlaps the Wi-Fi Direct subnet {WFD_P2P_SUBNET}",
+            "; ".join(conflicts)
+            + f"; move it off {WFD_P2P_SUBNET} (LAN/VPN/docker) to avoid a P2P clash",
+        )
+    return Check(
+        name,
+        STATUS_OK,
+        f"no interface overlaps the Wi-Fi Direct subnet {WFD_P2P_SUBNET}",
+        "",
+    )
+
+
+def _user_admin_groups() -> list[str]:
+    """Return which of WPA_DBUS_ADMIN_GROUPS the current user belongs to."""
+    gids = set(os.getgroups())
+    gids.add(os.getgid())
+    names: set[str] = set()
+    for gid in gids:
+        try:
+            names.add(grp.getgrgid(gid).gr_name)
+        except KeyError:
+            continue
+    return [name for name in WPA_DBUS_ADMIN_GROUPS if name in names]
+
+
+def _wpa_dbus_set_check() -> Check:
+    """Probe whether Properties.Set on wpa_supplicant is permitted for this user.
+
+    FluxCast's system.d policy grants Properties.Set only to wheel/sudo so
+    unprivileged accounts cannot write supplicant properties. A Set on a
+    non-existent property is authoritative: AccessDenied means the bus policy
+    blocks the call; InvalidArgs / No such property means the grant is live.
+    """
+    name = "wpa D-Bus Set"
+    if not shutil.which("gdbus"):
+        return Check(name, STATUS_WARN, "gdbus was not found", "cannot probe wpa_supplicant D-Bus policy")
+
+    args = [
+        "gdbus", "call", "--system",
+        "--dest", "fi.w1.wpa_supplicant1",
+        "--object-path", "/fi/w1/wpa_supplicant1",
+        "--method", "org.freedesktop.DBus.Properties.Set",
+        "fi.w1.wpa_supplicant1",
+        "FluxCastDoctorProbe",
+        "<'probe'>",
+    ]
+    try:
+        result = _run(args, timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check(name, STATUS_WARN, "could not probe wpa_supplicant D-Bus policy", str(exc))
+
+    text = (result.stdout + result.stderr).strip()
+    if "AccessDenied" in text:
+        membership = _user_admin_groups()
+        if membership:
+            detail = (
+                "Properties.Set is blocked despite admin group membership; "
+                "install meta/zz-dev.fluxcast.wpa-supplicant.conf and reload dbus"
+            )
+        else:
+            detail = (
+                f"add your user to {' or '.join(WPA_DBUS_ADMIN_GROUPS)} "
+                "(or re-login after usermod), then install the FluxCast D-Bus policy"
+            )
+        return Check(
+            name,
+            STATUS_WARN,
+            "Properties.Set on wpa_supplicant is denied",
+            detail,
+        )
+    if "No such property" in text or "InvalidArgs" in text:
+        return Check(name, STATUS_OK, "Properties.Set on wpa_supplicant is permitted", text)
+    if result.returncode != 0:
+        return Check(name, STATUS_WARN, "wpa_supplicant D-Bus probe failed", text)
+    return Check(name, STATUS_OK, "Properties.Set on wpa_supplicant is permitted", text)
+
+
+def _supplicant_capability_check() -> Check:
+    if not shutil.which("gdbus"):
+        return Check("wpa_supplicant P2P", STATUS_WARN, "gdbus was not found", "cannot query system D-Bus")
+
+    args = [
+        "gdbus", "call", "--system",
+        "--dest", "fi.w1.wpa_supplicant1",
+        "--object-path", "/fi/w1/wpa_supplicant1",
+        "--method", "org.freedesktop.DBus.Properties.Get",
+        "fi.w1.wpa_supplicant1",
+        "Capabilities",
+    ]
+    try:
+        result = _run(args, timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("wpa_supplicant P2P", STATUS_WARN, "could not query supplicant capabilities", str(exc))
+
+    text = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        return Check("wpa_supplicant P2P", STATUS_WARN, "supplicant capability query failed", text)
+    if "p2p" in text:
+        return Check("wpa_supplicant P2P", STATUS_OK, "wpa_supplicant reports P2P support", text)
+    return Check("wpa_supplicant P2P", STATUS_FAIL, "wpa_supplicant does not report P2P support", text)
+
+
+def _supplicant_wfd_check() -> Check:
+    if not shutil.which("gdbus"):
+        return Check("wpa_supplicant WFD", STATUS_WARN, "gdbus was not found", "cannot query WFDIE support")
+
+    args = [
+        "gdbus", "call", "--system",
+        "--dest", "fi.w1.wpa_supplicant1",
+        "--object-path", "/fi/w1/wpa_supplicant1",
+        "--method", "org.freedesktop.DBus.Properties.Get",
+        "fi.w1.wpa_supplicant1",
+        "WFDIEs",
+    ]
+    try:
+        result = _run(args, timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("wpa_supplicant WFD", STATUS_WARN, "could not query WFDIEs", str(exc))
+
+    text = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return Check("wpa_supplicant WFD", STATUS_OK, "wpa_supplicant accepts Wi-Fi Display IEs", text)
+    return Check(
+        "wpa_supplicant WFD",
+        STATUS_WARN,
+        "WFDIE query failed; supplicant may lack CONFIG_WIFI_DISPLAY",
+        text,
+    )
+
+
+def _ufw_enabled() -> Optional[bool]:
+    """Whether ufw is switched on, without needing root. None if unreadable.
+
+    `ufw status` refuses to run as a normal user, so read the ENABLED line
+    from ufw.conf, which ships world-readable. Not `systemctl is-active ufw`:
+    the unit can be active while ufw itself is disabled.
+    """
+    try:
+        with open("/etc/ufw/ufw.conf") as conf:
+            match = re.search(r"^\s*ENABLED\s*=\s*(\w+)", conf.read(),
+                              re.MULTILINE | re.IGNORECASE)
+    except OSError:
+        return None
+    return match.group(1).lower() == "yes" if match else None
+
+
+def _ufw_check() -> Optional[Check]:
+    if not shutil.which("ufw"):
+        return None
+
+    try:
+        result = _run(["ufw", "status"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check("firewall (ufw)", STATUS_WARN, "could not query ufw status", str(exc))
+
+    output = (result.stdout + result.stderr).strip()
+    # ufw prints the root error and still exits 0, so match the text rather
+    # than trusting the return code.
+    if re.search(r"need to be root|permission denied", output, re.IGNORECASE):
+        # Returning None here is what let #98 happen: --doctor is normally run
+        # unprivileged, so the one line that would have named port 7236 left
+        # the report entirely and the session just hung with no explanation.
+        enabled = _ufw_enabled()
+        if enabled is False:
+            return Check("firewall (ufw)", STATUS_OK,
+                         "ufw is installed but disabled; port not blocked",
+                         "read from /etc/ufw/ufw.conf; ufw status needs root")
+        detail = (f"open it with: sudo ufw allow {WFD_RTSP_PORT}/tcp\n"
+                  "  or check the current rules with: sudo ufw status")
+        if enabled is None:
+            return Check("firewall (ufw)", STATUS_WARN,
+                         f"could not verify whether ufw allows port {WFD_RTSP_PORT}",
+                         detail)
+        return Check("firewall (ufw)", STATUS_WARN,
+                     f"ufw is enabled; port {WFD_RTSP_PORT} needs root to verify",
+                     detail)
+    if result.returncode != 0:
+        return Check("firewall (ufw)", STATUS_WARN, "ufw status query failed", output)
+
+    if re.search(r"Status:\s*inactive", output, re.IGNORECASE):
+        return Check("firewall (ufw)", STATUS_OK, "ufw is inactive; port not blocked", output)
+
+    # Only treat the port as open when an explicit ALLOW rule covers its TCP
+    # entry; a bare port match would also accept DENY/REJECT or udp-only rules.
+    if re.search(rf"\b{WFD_RTSP_PORT}/tcp\b[^\n]*\bALLOW\b", output, re.IGNORECASE):
+        return Check(
+            "firewall (ufw)",
+            STATUS_OK,
+            f"ufw is active and allows port {WFD_RTSP_PORT}",
+            output,
+        )
+    return Check(
+        "firewall (ufw)",
+        STATUS_WARN,
+        f"ufw is active but port {WFD_RTSP_PORT} is not allowed",
+        f"open it with: sudo ufw allow {WFD_RTSP_PORT}/tcp",
+    )
+
+
+def _firewalld_active() -> Optional[bool]:
+    """True/False when systemd reports firewalld active/inactive, None when it
+    could not be asked (no systemctl, no systemd, timeout).
+
+    `firewall-cmd --state` goes through Polkit too; asking systemd does not.
+    """
+    if not shutil.which("firewall-cmd"):
+        return False
+    try:
+        result = _run(["systemctl", "is-active", "firewalld"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    state = result.stdout.strip()
+    if result.returncode == 0 and state == "active":
+        return True
+    if state in ("inactive", "failed"):
+        return False
+    return None  # e.g. "System has not been booted with systemd" on stderr
+
+
+def _firewalld_check() -> Optional[Check]:
+    if not shutil.which("firewall-cmd"):
+        return None
+
+    active = _firewalld_active()
+    if active is None:
+        # Without systemd's answer we do not know; firewalld may well be up and
+        # blocking, so this must not read as a definitive "not running".
+        return Check(
+            "firewall (firewalld)",
+            STATUS_WARN,
+            "could not verify whether firewalld is running (systemctl gave no answer)",
+        )
+    if not active:
+        return Check(
+            "firewall (firewalld)",
+            STATUS_OK,
+            "firewalld is not running; port not blocked",
+        )
+
+    # This runs at every session start, so keep the short probe budget: a
+    # Polkit-gated query just becomes "could not verify" rather than a dialog
+    # the startup waits on. The session path in wfd/firewall.py, where the
+    # port actually matters, waits for the prompt.
+    try:
+        query = _run(["firewall-cmd", f"--query-port={WFD_RTSP_PORT}/tcp"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check(
+            "firewall (firewalld)",
+            STATUS_WARN,
+            f"could not verify whether firewalld allows port {WFD_RTSP_PORT}/tcp",
+            str(exc),
+        )
+
+    # `--query-port` prints `yes`/`no` (exit 0/1) for a real answer; anything
+    # else — empty output, an auth error — means we could not check the port.
+    # A non-zero exit is not proof the port is closed, so an auth failure must
+    # never become a definitive OK-or-closed. Report "couldn't verify" instead.
+    query_out = query.stdout.strip()
+    if query_out == "yes":
+        return Check(
+            "firewall (firewalld)",
+            STATUS_OK,
+            f"firewalld is running and allows port {WFD_RTSP_PORT}",
+            (query.stdout + query.stderr).strip(),
+        )
+    if query_out == "no":
+        return Check(
+            "firewall (firewalld)",
+            STATUS_WARN,
+            f"firewalld is running but port {WFD_RTSP_PORT}/tcp is closed",
+            f"open it with: sudo firewall-cmd --add-port={WFD_RTSP_PORT}/tcp --permanent && sudo firewall-cmd --reload",
+        )
+    return Check(
+        "firewall (firewalld)",
+        STATUS_WARN,
+        f"could not verify whether firewalld allows port {WFD_RTSP_PORT}/tcp",
+        (query.stdout + query.stderr).strip(),
+    )
+
+
+def _firewall_check() -> Check:
+    """Warn when a host firewall is active but the WFD RTSP port is closed.
+
+    A host may run more than one front-end (e.g. ufw inactive while firewalld
+    is active and blocking), so every available probe is consulted and the
+    worst-case result is reported rather than the first one found.
+    """
+    severity = {STATUS_OK: 0, STATUS_WARN: 1, STATUS_FAIL: 2}
+    results = [check for probe in (_ufw_check, _firewalld_check) if (check := probe()) is not None]
+    if results:
+        return max(results, key=lambda c: severity.get(c.status, 0))
+    return Check(
+        "firewall",
+        STATUS_SKIP,
+        "no supported firewall front-end detected",
+        f"checked ufw and firewall-cmd; open port {WFD_RTSP_PORT}/tcp manually if a firewall blocks it",
+    )
+
+
+def _python_check() -> Check:
+    return Check(
+        "python",
+        STATUS_OK,
+        "runtime",
+        f"{platform.python_version()} on {platform.system()} {platform.release()}",
+    )
+
+
+def _p2p_row_is_evidence(check: Check) -> bool:
+    """Whether the `iw P2P` row proves the kernel exposes Wi-Fi Direct.
+
+    An ok row obviously does. A warn raised for stale group interfaces does
+    too: P2P-client/P2P-GO netdevs only exist on a P2P-capable kernel, so a
+    leftover one still shows Wi-Fi Direct is supported (#166). Other warnings
+    (iw missing, no P2P-device shown, unsupported driver) are not evidence, and
+    leaving them out keeps the backend refusal behaviour unchanged.
+    """
+    return check.status == STATUS_OK or check.message.startswith(_LEFTOVER_GROUP_MSG)
+
+
+def run_diagnostics(skip_firewall: bool = False) -> DiagnosticReport:
+    firewall_check = (
+        Check("firewall", STATUS_SKIP, "disabled by --wfd-no-firewall")
+        if skip_firewall
+        else _firewall_check()
+    )
+    checks = [
+        _python_check(),
+        _command_check("ffmpeg", "video/audio transcoding", required=True),
+        _wf_recorder_check(),
+        _portal_process_check(),
+        _command_check("pactl", "PulseAudio/PipeWire-Pulse audio monitor detection"),
+        _command_check("xrandr", "X11 monitor detection fallback"),
+        _command_check("nmcli", "NetworkManager Wi-Fi Direct control"),
+        _command_check(
+            "dnsmasq",
+            "NetworkManager P2P DHCP server",
+            extra_paths=["/usr/sbin/dnsmasq"],
+        ),
+        _command_check("iw", "kernel Wi-Fi interface inspection", extra_paths=IW_PATHS),
+        _command_check("wpa_cli", "active Wi-Fi Direct scan/control", extra_paths=WPA_CLI_PATHS),
+        _command_check("gdbus", "passive wpa_supplicant D-Bus capability checks"),
+        _command_check("gst-launch-1.0", "optional future WFD GStreamer pipeline"),
+        _command_check("gst-inspect-1.0", "optional future WFD codec inspection"),
+        _portal_gst_elements_check(),
+        _python_module_check("dbus_next", "WFD portal capture control plane for KDE/GNOME Wayland"),
+        _ffmpeg_encoders(),
+        _display_capture_check(),
+        _audio_check(),
+        _nmcli_check(),
+        _subnet_conflict_check(),
+        _iw_p2p_check(),
+        _supplicant_capability_check(),
+        _supplicant_wfd_check(),
+        _wpa_dbus_set_check(),
+        firewall_check,
+    ]
+
+    by_name = {check.name: check for check in checks}
+    network_hw_ok = (
+        by_name.get("NetworkManager", Check("", STATUS_SKIP, "")).status == STATUS_OK
+        or _p2p_row_is_evidence(by_name.get("iw P2P", Check("", STATUS_SKIP, "")))
+    )
+    media_ok = (
+        by_name.get("ffmpeg encoders", Check("", STATUS_SKIP, "")).status == STATUS_OK
+        and by_name.get("screen capture", Check("", STATUS_SKIP, "")).status == STATUS_OK
+    )
+    dnsmasq_ok = by_name.get("dnsmasq", Check("", STATUS_WARN, "")).status == STATUS_OK
+    wfd_candidate = network_hw_ok and media_ok and dnsmasq_ok
+
+    if wfd_candidate:
+        summary = (
+            "Miracast/WFD looks possible via NetworkManager; raw supplicant "
+            "access is optional for this backend."
+        )
+    elif network_hw_ok:
+        summary = "Wi-Fi Direct hardware is visible, but media/capture readiness is incomplete."
+    else:
+        summary = "Miracast/WFD is not confirmed yet; check warn/fail rows above."
+    return DiagnosticReport(checks=checks, wfd_candidate=wfd_candidate, summary=summary)
+
+
+def print_report(report: DiagnosticReport) -> None:
+    print("[FluxCast Doctor] System capability report")
+    print(f"[FluxCast Doctor] {report.summary}")
+    print()
+    print(f"  {'Status':<6} {'Check':<22} Details")
+    print(f"  {'-' * 6} {'-' * 22} {'-' * 42}")
+    for check in report.checks:
+        detail = check.detail.replace("\n", " | ")
+        message = check.message
+        if detail:
+            message = f"{message} ({detail})"
+        print(f"  {check.status:<6} {check.name:<22} {message}")

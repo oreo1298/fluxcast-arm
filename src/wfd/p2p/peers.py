@@ -1,0 +1,233 @@
+import re
+import subprocess
+import time
+from typing import Optional
+
+from diagnostics import IW_PATHS, WPA_CLI_PATHS, _find_binary
+
+from ..config import WFDNotReady
+from ..constants import _DEVICE_NAME
+from ..ie import (
+    WFD_DEVICE_TYPE_SOURCE, WFDPeer, _wfd_capability_from_hex,
+    _wfd_ie_device_info, _wfd_ie_device_name,
+)
+from ..proc import _run
+from .dbus import P2P_GROUP_OWNER, WPS_PUSH_BUTTON
+from .nm import _nm_scan
+
+
+def _select_peer(peers: list[WFDPeer], selector: Optional[str]) -> WFDPeer:
+    if not peers:
+        raise WFDNotReady("No Wi-Fi Direct peers found. Put the TV into Screen Share/Wireless Display mode.")
+    if selector is None:
+        print_scan(peers)
+        try:
+            raw = input("Select WFD peer [0]: ").strip()
+        except EOFError:
+            raw = ""
+        selector = raw or "0"
+
+    if selector.isdigit():
+        index = int(selector)
+        if 0 <= index < len(peers):
+            return peers[index]
+        raise WFDNotReady(f"Peer index out of range: {selector}")
+
+    normalized = selector.lower()
+    for peer in peers:
+        if normalized in peer.address.lower() or normalized in peer.name.lower():
+            return peer
+    raise WFDNotReady(f"No peer matched selector: {selector}")
+
+def _scan_and_select(interface: Optional[str], selector: Optional[str],
+                     timeout: int, attempts: int = 3) -> WFDPeer:
+    """Scans and resolves peer. If no selector, does one scan and opens prompt.
+    With selector, retries non-deterministic scans
+    until resolved or raises original error.
+    """
+    if selector is None:
+        peers = active_scan(interface=interface, timeout=timeout)
+        return _select_peer(peers, None)
+
+    last_error: Optional[WFDNotReady] = None
+    for attempt in range(1, attempts + 1):
+        peers = active_scan(interface=interface, timeout=timeout)
+        try:
+            return _select_peer(peers, selector)
+        except WFDNotReady as exc:
+            last_error = exc
+            if attempt < attempts:
+                print(f"[FluxCast WFD] peer '{selector}' not in scan "
+                      f"{attempt}/{attempts}; rescanning...")
+    assert last_error is not None
+    raise last_error
+
+def _default_wifi_interface() -> Optional[str]:
+    iw = _find_binary("iw", IW_PATHS)
+    if not iw:
+        return None
+
+    try:
+        result = _run([iw, "dev"], timeout=3.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    current_iface = None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Interface "):
+            current_iface = stripped.split(maxsplit=1)[1]
+        elif stripped == "type managed" and current_iface:
+            return current_iface
+    return None
+
+def _parse_peer_capability(details: str) -> tuple[Optional[bool], Optional[int]]:
+    """Read a peer's WFD device type out of `wpa_cli p2p_peer` output.
+
+    Empty details means the lookup failed, which is unknown rather than
+    incapable. Details that mention no Wi-Fi Display field at all are a real
+    answer: the peer advertised none.
+    """
+    if not details:
+        return None, None
+
+    for line in details.splitlines():
+        stripped = line.strip()
+        for field in ("wfd_dev_info=", "wfd_subelems="):
+            if stripped.startswith(field):
+                return _wfd_capability_from_hex(stripped.partition("=")[2])
+    return False, None
+
+def _parse_peer_blockers(details: str) -> tuple[Optional[bool], Optional[bool]]:
+    """(is_group_owner, offers_push_button) from `wpa_cli p2p_peer` output."""
+    found: dict[str, int] = {}
+    for line in details.splitlines():
+        field, _, value = line.strip().partition("=")
+        if field in ("group_capab", "config_methods") and value:
+            try:
+                found[field] = int(value, 16 if value.lower().startswith("0x") else 10)
+            except ValueError:
+                pass
+    group = found.get("group_capab")
+    methods = found.get("config_methods")
+    return (
+        None if group is None else bool(group & P2P_GROUP_OWNER),
+        None if methods is None else bool(methods & WPS_PUSH_BUTTON),
+    )
+
+def _parse_peer_name(details: str) -> str:
+    for line in details.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("device_name="):
+            return stripped.partition("=")[2]
+    return ""
+
+def active_scan(interface: Optional[str] = None, timeout: int = 8) -> list[WFDPeer]:
+    """Run an active Wi-Fi Direct peer scan.
+    """
+    try:
+        return _nm_scan(interface=interface, timeout=timeout)
+    except WFDNotReady as nm_error:
+        print(f"[FluxCast WFD] NetworkManager scan unavailable: {nm_error}")
+
+    wpa_cli = _find_binary("wpa_cli", WPA_CLI_PATHS)
+    if not wpa_cli:
+        raise WFDNotReady("wpa_cli is required for active Wi-Fi Direct scans.")
+
+    iface = interface or _default_wifi_interface()
+    if not iface:
+        raise WFDNotReady("Could not detect a managed Wi-Fi interface for wpa_cli.")
+
+    print(f"[FluxCast WFD] Starting Wi-Fi Direct scan on {iface} for {timeout}s...")
+    try:
+        start = _run([wpa_cli, "-i", iface, "p2p_find", str(timeout)], timeout=5.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WFDNotReady(f"Could not start p2p_find: {exc}") from exc
+    if start.returncode != 0:
+        error = (start.stderr or start.stdout).strip()
+        if "Permission denied" in error:
+            raise WFDNotReady(
+                "wpa_cli cannot access the supplicant control interface. "
+                "This usually needs root, a ctrl_interface group, or a "
+                "NetworkManager D-Bus connection path. Raw error: " + error
+            )
+        raise WFDNotReady(error)
+
+    time.sleep(max(1, timeout))
+
+    try:
+        peers_result = _run([wpa_cli, "-i", iface, "p2p_peers"], timeout=5.0)
+    finally:
+        try:
+            _run([wpa_cli, "-i", iface, "p2p_stop_find"], timeout=3.0)
+        except Exception:
+            pass
+
+    if peers_result.returncode != 0:
+        raise WFDNotReady((peers_result.stderr or peers_result.stdout).strip())
+
+    peers = []
+    for raw in peers_result.stdout.splitlines():
+        address = raw.strip()
+        if not re.fullmatch(r"[0-9a-fA-F:]{17}", address):
+            continue
+
+        details = ""
+        try:
+            details_result = _run([wpa_cli, "-i", iface, "p2p_peer", address], timeout=5.0)
+            if details_result.returncode == 0:
+                details = details_result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        wfd_capable, wfd_device_type = _parse_peer_capability(details)
+        is_group_owner, offers_push_button = _parse_peer_blockers(details)
+        peers.append(WFDPeer(
+            address=address,
+            name=_parse_peer_name(details),
+            details=details,
+            source="wpa_cli",
+            wfd_capable=wfd_capable,
+            wfd_device_type=wfd_device_type,
+            is_group_owner=is_group_owner,
+            offers_push_button=offers_push_button,
+        ))
+
+    return peers
+
+def print_scan(peers: list[WFDPeer]) -> None:
+    if not peers:
+        print("[FluxCast WFD] No Wi-Fi Direct peers found.")
+        return
+
+    print("[FluxCast WFD] Wi-Fi Direct peer(s):")
+    for idx, peer in enumerate(peers):
+        name = f"  {peer.name}" if peer.name else ""
+        source = f" via {peer.source}" if peer.source else ""
+        print(f"  [{idx}] {peer.address}{name}{source}")
+        if peer.wfd_capable:
+            print("      WFD capability data detected")
+        elif peer.wfd_capable is False:
+            # Say something, because connecting to a non-sink succeeds at the
+            # P2P layer and then sits in NetworkManager's config state until
+            # the 35s timeout with nothing on screen explaining why (#121).
+            #
+            # Report what was advertised rather than reaching a verdict. A
+            # sink only advertises Wi-Fi Display while it is waiting for a
+            # connection, so "not a sink" and "a sink that is still on a
+            # normal input" look identical from here, and the second is the
+            # common case - a maintainer hit it on a TV he streams to daily.
+            # Naming the state points at the fix instead of at the device.
+            if peer.wfd_device_type == WFD_DEVICE_TYPE_SOURCE:
+                print("      advertising Wi-Fi Display as a source, not a sink "
+                      "- another sender, not a display")
+            else:
+                print("      not advertising Wi-Fi Display; if this is a TV, "
+                      "put it into Screen Share mode first")
+
+        # Either of these makes the connection impossible; unsaid, the user
+        # spends 35 seconds on it and gets a bare timeout (#136, #137).
+        if peer.is_group_owner:
+            print("      already running its own group; FluxCast can start a "
+                  "new one but cannot join an existing group")
+        if peer.offers_push_button is False:
+            print("      pairs by PIN only; FluxCast connects by push button")

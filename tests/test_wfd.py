@@ -1,0 +1,818 @@
+import contextlib
+import inspect
+import io
+import os
+import subprocess
+import sys
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from wfd import ts_probe  # noqa: E402
+import wfd  # noqa: E402
+
+
+def patch_all(name, **kwargs):
+    """Patch `name` in every wfd module that binds it, with one shared mock.
+
+    A module that did `from ..gst import _gst_has_element` holds its own
+    reference, so patching the package facade stops working the moment the
+    caller moves into a submodule, and naming one submodule rots silently the
+    next time it moves again. Raising when nothing matched means a renamed or
+    deleted target fails loudly instead of quietly testing nothing.
+    """
+    replacement = mock.MagicMock(**kwargs)
+    targets = [module for modname, module in list(sys.modules.items())
+               if module is not None
+               and (modname == "wfd" or modname.startswith("wfd."))
+               and name in vars(module)]
+    if not targets:
+        raise AssertionError(f"{name} is not bound in any wfd module")
+
+    @contextlib.contextmanager
+    def _patched():
+        with contextlib.ExitStack() as stack:
+            for module in targets:
+                stack.enter_context(mock.patch.object(module, name, replacement))
+            yield replacement
+
+    return _patched()
+
+
+def _round4(value):
+    """GST_ROUND_UP_4, how GStreamer sizes an I420 plane stride."""
+    return (value + 3) & ~3
+
+
+def _completed(stdout="", returncode=0, stderr=""):
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+class VideoModeTableTest(unittest.TestCase):
+    KNOWN_INCONSISTENT = {"1920x1200p30", "1920x1200p60"}
+
+    def test_native_byte_matches_the_mode_bit(self):
+        mismatched = set()
+        for bit, mode in {**wfd.WFD_CEA_MODES, **wfd.WFD_VESA_MODES}.items():
+            native = int(mode.native, 16)
+            table = 1 if mode.table == "vesa" else 0
+            if (native & 0x07, native >> 3) != (table, bit.bit_length() - 1):
+                mismatched.add(mode.name)
+
+        self.assertEqual(mismatched, self.KNOWN_INCONSISTENT)
+
+    def test_level_is_a_single_defined_bit(self):
+        defined = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40}
+        for mode in {**wfd.WFD_CEA_MODES, **wfd.WFD_VESA_MODES}.values():
+            level = wfd._wfd_level_for_mode(mode)
+            self.assertIn(level, defined, f"{mode.name} has an undefined level")
+
+
+class FfmpegProgressArgsTest(unittest.TestCase):
+    def test_progress_stats_are_disabled_by_default(self):
+        args = wfd._ffmpeg_sender_args()
+
+        self.assertEqual(
+            args,
+            ["ffmpeg", "-hide_banner", "-y", "-loglevel", "warning"],
+        )
+
+    def test_progress_stats_can_be_enabled(self):
+        args = wfd._ffmpeg_sender_args(show_stats=True)
+
+        self.assertIn("-stats", args)
+
+
+class UfwSessionHintTest(unittest.TestCase):
+    """On a ufw host the firewalld path opens nothing and used to print
+    nothing, so the user got a session that waits for an RTSP connection the
+    firewall is dropping, with no clue why (#98).
+    """
+
+    def _hint_output(self, ufw_enabled, ports=None, firewalld=False):
+        if ports is None:
+            ports = [(wfd.WFD_RTSP_PORT, "RTSP")]
+        buf = io.StringIO()
+        with (
+            patch_all("_firewalld_active", return_value=firewalld),
+            patch_all("_ufw_enabled", return_value=ufw_enabled),
+            contextlib.redirect_stdout(buf),
+        ):
+            wfd._warn_if_ufw_may_block(ports)
+        return buf.getvalue()
+
+    def test_enabled_ufw_prints_the_port_and_command(self):
+        out = self._hint_output(True)
+        self.assertIn(str(wfd.WFD_RTSP_PORT), out)
+        self.assertIn(f"ufw allow {wfd.WFD_RTSP_PORT}/tcp", out)
+
+    def test_disabled_ufw_stays_quiet(self):
+        self.assertEqual(self._hint_output(False), "")
+
+    def test_unknown_ufw_state_stays_quiet(self):
+        # Guessing out loud on a host we could not read is just noise.
+        self.assertEqual(self._hint_output(None), "")
+
+    def test_firewalld_host_stays_quiet(self):
+        # There the ports get opened for real; ufw is not in the picture.
+        self.assertEqual(self._hint_output(True, firewalld=True), "")
+
+    def test_uibc_port_is_named_as_uibc_not_rtsp(self):
+        """The hint used to be printed by _open_wfd_firewall_port, so
+        --wfd-uibc produced a second copy of it, and that copy read "if the
+        sink never opens its RTSP connection, allow port 7239/tcp" - which is
+        not what 7239 is. One hint, each port labelled.
+        """
+        out = self._hint_output(True, ports=[(wfd.WFD_RTSP_PORT, "RTSP"),
+                                             (wfd.WFD_UIBC_PORT, "UIBC")])
+        self.assertEqual(out.count("ufw is enabled"), 1)
+        self.assertIn(f"ufw allow {wfd.WFD_RTSP_PORT}/tcp    # RTSP", out)
+        self.assertIn(f"ufw allow {wfd.WFD_UIBC_PORT}/tcp    # UIBC", out)
+
+    def test_opening_a_port_prints_no_hint_of_its_own(self):
+        # The per-port call is what made it print twice.
+        buf = io.StringIO()
+        with (
+            patch_all("_firewalld_active", return_value=False),
+            patch_all("_ufw_enabled", return_value=True),
+            contextlib.redirect_stdout(buf),
+        ):
+            opened = wfd._open_wfd_firewall_port(wfd.WFD_RTSP_PORT)
+        self.assertFalse(opened)  # never claims to have opened anything
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_hint_runs_no_subprocess(self):
+        # The connect path must not block on a firewall probe (#114).
+        with (
+            patch_all("_firewalld_active", return_value=False),
+            patch_all("_ufw_enabled", return_value=True),
+            patch_all("_run", side_effect=AssertionError("no subprocess here")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            wfd._warn_if_ufw_may_block([(wfd.WFD_RTSP_PORT, "RTSP")])
+
+
+class FirewallPortTest(unittest.TestCase):
+    def test_existing_port_skips_privileged_add(self):
+        calls = []
+        port = wfd.WFD_RTSP_PORT
+
+        def fake_run(args, timeout=5.0):
+            calls.append((args, timeout))
+            return _completed("yes")
+
+        with (
+            patch_all("_firewalld_active", return_value=True),
+            patch_all("_run", side_effect=fake_run),
+        ):
+            opened = wfd._open_wfd_firewall_port(port)
+
+        self.assertFalse(opened)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f"--query-port={port}/tcp", calls[0][0])
+
+    def test_closed_port_is_opened_after_successful_query(self):
+        calls = []
+        port = wfd.WFD_RTSP_PORT
+
+        def fake_run(args, timeout=5.0):
+            calls.append((args, timeout))
+            if f"--query-port={port}/tcp" in args:
+                return _completed("no", returncode=1)
+            return _completed("success")
+
+        with (
+            patch_all("_firewalld_active", return_value=True),
+            patch_all("_run", side_effect=fake_run),
+        ):
+            opened = wfd._open_wfd_firewall_port(port)
+
+        self.assertTrue(opened)
+        self.assertIn(f"--query-port={port}/tcp", calls[0][0])
+        self.assertIn(f"--add-port={port}/tcp", calls[1][0])
+        # Both calls can block on the same Polkit dialog (#114).
+        self.assertEqual(calls[0][1], calls[1][1])
+        self.assertEqual(calls[0][1], wfd._FIREWALL_AUTH_TIMEOUT)
+
+    def test_unknown_firewalld_state_skips_without_querying(self):
+        # None ("couldn't ask systemd") is treated like inactive here: no
+        # firewall-cmd call, no Polkit dialog, nothing to undo on exit.
+        with (
+            patch_all("_firewalld_active", return_value=None),
+            patch_all("_run") as run,
+        ):
+            opened = wfd._open_wfd_firewall_port(wfd.WFD_RTSP_PORT)
+
+        self.assertFalse(opened)
+        run.assert_not_called()
+
+    def test_query_error_fails_closed_without_add(self):
+        port = wfd.WFD_RTSP_PORT
+        calls = []
+
+        def fake_run(args, timeout=5.0):
+            calls.append(args)
+            return _completed("", returncode=1, stderr="Authorization failed")
+
+        output = io.StringIO()
+        with (
+            patch_all("_firewalld_active", return_value=True),
+            patch_all("_run", side_effect=fake_run),
+            contextlib.redirect_stdout(output),
+        ):
+            opened = wfd._open_wfd_firewall_port(port)
+
+        self.assertFalse(opened)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f"--query-port={port}/tcp", calls[0])
+        self.assertIn("Authorization failed", output.getvalue())
+        self.assertIn("--wfd-no-firewall", output.getvalue())
+
+    def test_query_timeout_fails_closed_without_add(self):
+        calls = []
+        port = wfd.WFD_RTSP_PORT
+
+        def fake_run(args, timeout=5.0):
+            calls.append(args)
+            raise subprocess.TimeoutExpired(args, timeout)
+
+        with (
+            patch_all("_firewalld_active", return_value=True),
+            patch_all("_run", side_effect=fake_run),
+        ):
+            opened = wfd._open_wfd_firewall_port(port)
+
+        self.assertFalse(opened)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f"--query-port={port}/tcp", calls[0])
+
+
+class ProgMapTest(unittest.TestCase):
+    def test_default_prog_map_is_unchanged(self):
+        self.assertEqual(
+            wfd._wfd_gst_prog_map(True), "program_map,sink_4113=1,sink_4352=1"
+        )
+        self.assertEqual(wfd._wfd_gst_prog_map(False), "program_map,sink_4113=1")
+
+    def test_flag_pins_the_pmt_pid_as_uint(self):
+        # PMT_%d is read as uint; a plain int is silently ignored.
+        for with_audio in (True, False):
+            self.assertIn(",PMT_1=(uint)256", wfd._wfd_gst_prog_map(with_audio, True))
+
+    def test_pcr_pid_is_never_requested(self):
+        for aosp in (True, False):
+            for with_audio in (True, False):
+                self.assertNotIn("PCR_1", wfd._wfd_gst_prog_map(with_audio, aosp))
+
+    def test_media_config_defaults_to_off(self):
+        self.assertFalse(wfd.WFDMediaConfig(monitor=None).aosp_pmt_pid)
+
+
+class AospTablesVersionTest(unittest.TestCase):
+    def _args(self, aosp):
+        config = wfd.WFDMediaConfig(monitor=None, output_resolution="1280x720",
+                                    aosp_pmt_pid=aosp)
+        pipeline = wfd.WFDMediaPipeline(config, tv_ip="10.42.0.2", local_ip="10.42.0.1",
+                                        sink_rtp_port=35034)
+        return pipeline._common_output_args()
+
+    def test_default_sends_no_version_override(self):
+        args = self._args(False)
+        self.assertNotIn("-tables_version", args)
+        self.assertNotIn("-sdt_period", args)
+        self.assertEqual(args[args.index("-mpegts_pmt_start_pid") + 1], "4096")
+
+    def test_flag_stamps_version_1_like_aosp(self):
+        # AOSP writes 0xc3 (version_number=1) in PAT and PMT; both muxers
+        # default to 0, which a sink seeded at 0 can treat as already seen.
+        args = self._args(True)
+        self.assertEqual(args[args.index("-tables_version") + 1], "1")
+        self.assertEqual(args[args.index("-mpegts_pmt_start_pid") + 1], "256")
+
+    def test_version_args_precede_the_output(self):
+        args = self._args(True)
+        self.assertLess(args.index("-tables_version"), args.index("-f"))
+
+
+class AspectRatioTest(unittest.TestCase):
+    """A portrait monitor must be letterboxed into the WFD mode, not stretched."""
+
+    def test_fit_inside_keeps_ratio_and_even_dimensions(self):
+        for src, expected in [((1920, 1080), (1280, 720)), ((2560, 1440), (1280, 720)),
+                              ((1080, 1920), (400, 710)), ((1024, 768), (960, 720)),
+                              ((3440, 1440), (1280, 534))]:
+            got = wfd._fit_inside(src[0], src[1], 1280, 720)
+            self.assertEqual(got, expected, f"{src} fitted wrong")
+            self.assertEqual((got[0] % 2, got[1] % 2), (0, 0), "yuv420p needs even sizes")
+            self.assertLessEqual(got[0], 1280)
+            self.assertLessEqual(got[1], 720)
+
+    def test_fit_inside_keeps_the_i420_strides_unpadded(self):
+        """GStreamer pads I420 strides to 4 bytes; ffmpeg's rawvideo does not
+        expect that, so a width off a multiple of 8 drifts every frame (#84)."""
+        for src in [(1440, 2560), (1080, 1920), (2160, 3840), (1366, 768),
+                    (1920, 1080), (1024, 768), (3440, 1440), (0, 0)]:
+            for out in [(1280, 720), (1920, 1080), (1366, 768)]:
+                w, h = wfd._fit_inside(src[0], src[1], out[0], out[1])
+                self.assertEqual(w % 8, 0, f"{src}->{out} width {w} pads the Y stride")
+                self.assertEqual(_round4(w) * h + 2 * _round4(w // 2) * (h // 2),
+                                 w * h * 3 // 2,
+                                 f"{src}->{out} frame is not w*h*3/2 bytes")
+
+    def test_fit_inside_survives_a_missing_source_size(self):
+        self.assertEqual(wfd._fit_inside(0, 0, 1280, 720), (1280, 720))
+
+    def test_portrait_capture_size_drives_the_silent_capture_threshold(self):
+        """The pipe carries cap_w x cap_h frames, so the one-frame floor must
+        be measured on those, not on the padded output size (#84)."""
+        src = inspect.getsource(wfd.WFDMediaPipeline._start_desktop_portal_ffmpeg)
+        self.assertIn("frame_bytes = cap_w * cap_h * 3 // 2", src)
+
+    def test_ffmpeg_filter_fits_without_stretching(self):
+        vf = wfd._letterbox_vf("1280x720")
+        self.assertIn("force_original_aspect_ratio=decrease", vf)
+        self.assertIn("pad=1280:720:(ow-iw)/2:(oh-ih)/2", vf)
+        self.assertIn("setsar=1", vf)
+
+    def test_generated_pipelines_never_stretch(self):
+        commands = _gst_commands()
+        self.assertGreaterEqual(len(commands), 3, "expected one argv per gst pipeline")
+        for cmd in commands:
+            index = cmd.index("videoscale")
+            caps = next(a for a in cmd[index:] if a.startswith("video/x-raw") and "width=" in a)
+            self.assertIn("pixel-aspect-ratio=1/1", caps)
+
+    def test_portal_gst_pipeline_letterboxes_a_2880x1920_screen(self):
+        """pipewiresrc can renegotiate its size, so a lone videoscale to the
+        16:9 mode makes the compositor squeeze a 3:2 screen into it. The
+        portal chain must pin the fitted size, then pad it into the mode."""
+        portal = next(c for c in _gst_commands(size=(2880, 1920))
+                      if "pipewiresrc" in c and "mpegtsmux" in c)
+        fitted = portal.index("video/x-raw,width=1080,height=720,pixel-aspect-ratio=1/1")
+        self.assertEqual(portal[fitted + 2:fitted + 5], ["videoscale", "add-borders=true", "n-threads=0"])
+        self.assertTrue(portal[fitted + 6].startswith("video/x-raw,width=1280,height=720,"))
+
+    def test_portal_gst_pipeline_skips_padding_for_a_matching_ratio(self):
+        portal = next(c for c in _gst_commands(size=(1920, 1080))
+                      if "pipewiresrc" in c and "mpegtsmux" in c)
+        self.assertNotIn("add-borders=true", portal)
+        self.assertEqual(portal.count("videoscale"), 1)
+
+    def _window_chain(self, pw_props=frozenset({"provide-clock"})):
+        # KWin's portal reply has no size for a window.
+        return next(c for c in _gst_commands(size=None, source_type=2, pw_props=pw_props)
+                    if "pipewiresrc" in c and "mpegtsmux" in c)
+
+    def test_portal_window_is_letterboxed_frame_by_frame(self):
+        """A window has no size to pin and changes it on every resize. KWin
+        tags its frames pixel-aspect-ratio=1/2147483647, so the PAR is reset
+        first and one add-borders videoscale fits each frame into the mode."""
+        portal = self._window_chain()
+        setter = portal.index("capssetter")
+        self.assertEqual(portal[setter + 1], "caps=video/x-raw,pixel-aspect-ratio=1/1")
+        scale = portal.index("videoscale")
+        self.assertGreater(scale, setter)
+        self.assertEqual(portal[scale + 1], "add-borders=true")
+        self.assertEqual(portal.count("videoscale"), 1)
+        self.assertTrue(portal[scale + 4].startswith("video/x-raw,width=1280,height=720,"))
+        self.assertFalse(any(a.startswith("video/x-raw,width=") for a in portal[:scale]),
+                         "a pinned size would stretch the window after a resize")
+
+    def test_portal_window_does_not_clock_the_pipeline(self):
+        """pipewiresrc's clock stops while a resize renegotiates the stream
+        and the source then stalls for seconds."""
+        self.assertIn("provide-clock=false", self._window_chain())
+        self.assertNotIn("provide-clock=false", self._window_chain(pw_props=frozenset()))
+
+    def test_portal_monitor_keeps_its_pinned_letterbox(self):
+        portal = next(c for c in _gst_commands(size=(2880, 1920))
+                      if "pipewiresrc" in c and "mpegtsmux" in c)
+        self.assertNotIn("capssetter", portal)
+        self.assertNotIn("provide-clock=false", portal)
+
+
+def _gst_commands(size=(1080, 1920), encoder="x264", has_va=True, rate_control="qvbr",
+                  dmabuf_fails=False, va_rate_controls=("cbr", "vbr", "qvbr"),
+                  source_type=1, pw_props=frozenset(), ffmpeg=False):
+    """Generated gst argv for every WFD pipeline that scales."""
+    class Mon:
+        name, width, height, x, y, display = "eDP-1", 1080, 1920, 0, 0, ":0"
+
+    class Sess:
+        session_handle, pw_node_id, pw_fd, restore_token = "/h", 7, 42, None
+        position = (0, 0)
+        stream_label, runtime, bus = "m", None, None
+
+    if size is not None:
+        Mon.width, Mon.height = size
+    Sess.size = size
+    Sess.source_type = source_type
+
+    captured = []
+
+    class Proc:
+        returncode = 0
+        pid = 4242
+
+        def __init__(self, cmd=()):
+            self.stdout = io.BytesIO()
+            self.failed = dmabuf_fails and "video/x-raw(memory:DMABuf)" in cmd
+
+        def poll(self):
+            return 1 if self.failed else None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def communicate(self, *a, **k):
+            return (b"", b"")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    config = wfd.WFDMediaConfig(monitor=Mon(), output_resolution="1280x720", fps=30,
+                                bitrate="4M", no_audio=True, peer_name="X", encoder=encoder,
+                                rate_control=rate_control)
+    pipeline = wfd.WFDMediaPipeline(config, tv_ip="10.42.0.2", local_ip="10.42.0.1",
+                                    sink_rtp_port=35034)
+    pipeline.tx_interface = "lo"
+    with (
+        mock.patch.object(wfd.shutil, "which", side_effect=lambda n: "/usr/bin/" + n),
+        patch_all("_gst_has_element", side_effect=lambda n: has_va or n != "vah264enc"),
+        patch_all("_detect_audio_monitor", return_value="m"),
+        patch_all("_gst_pipewiresrc_properties", return_value=set(pw_props)),
+        patch_all("_gst_x264enc_properties", return_value=set()),
+        patch_all("_gst_vah264enc_rate_controls", return_value=set(va_rate_controls)),
+        patch_all("_pipewiresrc_selector_attempts",
+                          return_value=[("path", ["path=7"])]),
+        patch_all("start_portal_capture", return_value=Sess()),
+        patch_all("close_portal_capture"),
+        patch_all("_process_written_bytes", return_value=None),
+        mock.patch.object(wfd.subprocess, "Popen",
+                          side_effect=lambda cmd, *a, **k: (captured.append(list(cmd)),
+                                                            Proc(cmd))[1]),
+        mock.patch.object(wfd.time, "sleep"),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        pipeline._start_desktop_gst_x11()
+        pipeline._start_desktop_portal()
+        config.aosp_pmt_pid = True
+        pipeline._start_desktop_portal_ffmpeg()
+    if ffmpeg:
+        return [c for c in captured if "libx264" in c]
+    return [c for c in captured if c and c[0].startswith("gst-launch")]
+
+
+class X264ThreadsTest(unittest.TestCase):
+    """With sliced threads x264 encodes one slice per thread; on auto that is
+    one per CPU, which costs CPU and compression on many-core machines."""
+
+    def test_threads_cap_at_four_and_follow_affinity(self):
+        for cpus, expected in ((16, 4), (4, 4), (2, 2), (1, 1)):
+            with mock.patch.object(wfd.encoding.os, "sched_getaffinity",
+                                   return_value=set(range(cpus))):
+                self.assertEqual(wfd._x264_threads(), expected)
+
+    def test_every_x264_pipeline_caps_its_threads(self):
+        with mock.patch.object(wfd.encoding.os, "sched_getaffinity",
+                               return_value=set(range(16))):
+            gst = [c for c in _gst_commands() if "x264enc" in c]
+            ffmpeg = _gst_commands(ffmpeg=True)
+        self.assertGreaterEqual(len(gst), 2)
+        for cmd in gst:
+            enc = cmd[cmd.index("x264enc"):]
+            self.assertIn("threads=4", enc)
+            self.assertNotIn("threads=0", enc)
+        self.assertTrue(ffmpeg)
+        for cmd in ffmpeg:
+            self.assertEqual(cmd[cmd.index("-threads") + 1], "4")
+
+
+class PipewireBufferHandbackTest(unittest.TestCase):
+    """always-copy=false let the queue and x264enc hold PipeWire's own buffers
+    until the pool drained and capture stopped after a few seconds (#147)."""
+
+    def test_portal_gst_pipeline_copies_out_of_the_pool(self):
+        chain = next(c for c in _gst_commands()
+                     if "pipewiresrc" in c and "x264enc" in c)
+        self.assertIn("always-copy=true", chain)
+
+    def test_no_generated_pipeline_asks_to_keep_pipewire_buffers(self):
+        """Guards the literal against being re-added; the ffmpeg path leaves the
+        property unset rather than setting it either way."""
+        for cmd in _gst_commands():
+            self.assertNotIn("always-copy=false", cmd)
+
+
+class PortalVaEncoderTest(unittest.TestCase):
+    def _portal(self, **kwargs):
+        return next(c for c in _gst_commands(**kwargs)
+                    if "pipewiresrc" in c and "mpegtsmux" in c)
+
+    def test_default_encoder_is_x264enc(self):
+        portal = self._portal()
+        self.assertIn("x264enc", portal)
+        self.assertNotIn("vah264enc", portal)
+
+    def test_va_encoder_replaces_x264enc(self):
+        portal = self._portal(encoder="va")
+        self.assertNotIn("x264enc", portal)
+        enc = portal.index("vah264enc")
+        self.assertTrue(portal[enc - 2].startswith("video/x-raw(memory:VAMemory),format=NV12,"))
+        self.assertEqual(portal[enc - 7], "vacompositor")
+        bitrate = int(next(a for a in portal[enc:] if a.startswith("bitrate=")).split("=")[1])
+        for arg in ("rate-control=qvbr", "ref-frames=1", "num-slices=8", f"cpb-size={bitrate // 5}",
+                    "key-int-max=30", "b-frames=0", "aud=true"):
+            self.assertIn(arg, portal[enc:])
+        caps = next(a for a in portal[enc:] if a.startswith("video/x-h264"))
+        self.assertIn("profile=constrained-baseline", caps)
+
+    def test_va_tries_dmabuf_first(self):
+        portal = self._portal(encoder="va")
+        self.assertIn("video/x-raw(memory:DMABuf)", portal)
+        self.assertNotIn("always-copy=true", portal)
+        self.assertNotIn("videoconvert", portal)
+        post = portal.index("vapostproc")
+        self.assertTrue(portal[post + 2].startswith("video/x-raw(memory:VAMemory),format=NV12,width=400,height=710"))
+        comp = portal.index("vacompositor")
+        self.assertEqual(portal[comp + 2:comp + 4], ["sink_0::xpos=440", "sink_0::ypos=5"])
+        self.assertTrue(portal[comp + 5].startswith("video/x-raw(memory:VAMemory),format=NV12,width=1280,height=720"))
+
+    def test_va_dmabuf_queue_depth_is_a_frame_count(self):
+        """With queue's default 10 MB byte limit a 1080p VA surface (3.19 MB)
+        capped the depth at four whatever max-size-buffers said."""
+        portal = self._portal(encoder="va")
+        post = portal.index("vapostproc")
+        q = portal.index("queue", post)
+        self.assertEqual(portal[q + 1:q + 5], ["max-size-buffers=4", "max-size-bytes=0",
+                                               "max-size-time=0", "leaky=downstream"])
+
+    def test_va_falls_back_to_the_cpu_chain_without_dmabuf(self):
+        portals = [c for c in _gst_commands(encoder="va", dmabuf_fails=True)
+                   if "pipewiresrc" in c and "mpegtsmux" in c]
+        self.assertIn("video/x-raw(memory:DMABuf)", portals[0])
+        fallback = portals[1]
+        self.assertIn("always-copy=true", fallback)
+        enc = fallback.index("vacompositor")
+        self.assertEqual(fallback[enc - 2], "video/x-raw,format=NV12")
+
+    def test_va_window_skips_dmabuf_and_follows_resizes(self):
+        """The DMABuf chain pins one fitted size, which stretches a window once
+        it is resized; the CPU chain letterboxes every frame instead."""
+        portals = [c for c in _gst_commands(encoder="va", size=None, source_type=2)
+                   if "pipewiresrc" in c and "mpegtsmux" in c]
+        self.assertEqual(len(portals), 1)
+        portal = portals[0]
+        self.assertNotIn("video/x-raw(memory:DMABuf)", portal)
+        self.assertIn("vah264enc", portal)
+        self.assertIn("capssetter", portal)
+        self.assertEqual(portal[portal.index("videoscale") + 1], "add-borders=true")
+
+    def test_va_rate_control_can_be_cbr(self):
+        portal = self._portal(encoder="va", rate_control="cbr")
+        self.assertIn("rate-control=cbr", portal[portal.index("vah264enc"):])
+
+    def test_va_qvbr_falls_back_to_vbr_when_the_driver_lacks_it(self):
+        portal = self._portal(encoder="va", va_rate_controls=("cbr", "vbr"))
+        self.assertIn("rate-control=vbr", portal[portal.index("vah264enc"):])
+
+    def test_va_encoder_falls_back_to_x264enc_when_missing(self):
+        portal = self._portal(encoder="va", has_va=False)
+        self.assertIn("x264enc", portal)
+        self.assertNotIn("vah264enc", portal)
+
+
+def _sequence(values):
+    """Yield the given values, then repeat the last one forever."""
+    state = list(values)
+    def next_value(*_a, **_k):
+        return state.pop(0) if len(state) > 1 else state[0]
+    return next_value
+
+
+class PortalPreflightTest(unittest.TestCase):
+    """The portal preflight must name every element its pipelines use."""
+
+    def _pipeline(self):
+        class Mon:
+            name, width, height, x, y, display = "eDP-1", 1080, 1920, 0, 0, ":0"
+
+        config = wfd.WFDMediaConfig(monitor=Mon(), output_resolution="1280x720", fps=30,
+                                    bitrate="4M", no_audio=True, peer_name="X")
+        pipeline = wfd.WFDMediaPipeline(config, tv_ip="10.42.0.2", local_ip="10.42.0.1",
+                                        sink_rtp_port=35034)
+        pipeline.tx_interface = "lo"
+        return pipeline
+
+    def test_missing_videorate_is_caught_before_the_pipeline_starts(self):
+        """Every portal pipeline goes through _gst_video_chain, which always links
+        videorate, so a host without that element has to fail the preflight rather
+        than at gst-launch time with a parse error."""
+        pipeline = self._pipeline()
+        with (
+            mock.patch.object(wfd.shutil, "which", side_effect=lambda n: "/usr/bin/" + n),
+            patch_all("_gst_has_element", side_effect=lambda name: name != "videorate"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(wfd.WFDNotReady) as raised:
+                pipeline._start_desktop_portal()
+        self.assertIn("videorate", str(raised.exception))
+
+    def test_preflight_passes_when_every_element_is_present(self):
+        """The same preflight must not block a host that does have videorate."""
+        pipeline = self._pipeline()
+        with (
+            mock.patch.object(wfd.shutil, "which", side_effect=lambda n: "/usr/bin/" + n),
+            patch_all("_gst_has_element", return_value=True),
+            patch_all("start_portal_capture", side_effect=RuntimeError("past the preflight")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                pipeline._start_desktop_portal()
+        self.assertIn("past the preflight", str(raised.exception))
+
+
+class CapturePipeTest(unittest.TestCase):
+    """The portal->ffmpeg pipe must not report success on a silent capture."""
+
+    def _run(self, written, producer_alive=True, consumer_alive=True, min_bytes=1):
+        # written may be a list (consumed in order) or a callable per poll.
+        config = wfd.WFDMediaConfig(monitor=None, aosp_pmt_pid=True)
+        pipeline = wfd.WFDMediaPipeline(config, tv_ip="10.42.0.2", local_ip="10.42.0.1",
+                                        sink_rtp_port=35034)
+        procs = []
+
+        class Proc:
+            def __init__(self, alive):
+                self.stdout = io.BytesIO()
+                self.pid = 1000 + len(procs)
+                self._alive = alive
+                self.terminated = False
+
+            def poll(self):
+                return None if self._alive else 1
+
+            def terminate(self):
+                self.terminated = True
+
+        def fake_popen(cmd, *a, **k):
+            proc = Proc(producer_alive if not procs else consumer_alive)
+            procs.append(proc)
+            return proc
+
+        errors = []
+        with (
+            mock.patch.object(wfd.subprocess, "Popen", side_effect=fake_popen),
+            patch_all("_process_written_bytes",
+                              side_effect=written if callable(written)
+                              else _sequence(written)),
+            mock.patch.object(wfd.time, "sleep"),
+        ):
+            ok = pipeline._spawn_capture_pipe(["gst"], ["ffmpeg"], errors, "path",
+                                              min_bytes=min_bytes)
+        return ok, errors, pipeline, procs
+
+    def test_flowing_capture_is_accepted(self):
+        ok, errors, pipeline, _ = self._run([0, 5_000_000], min_bytes=1_000_000)
+        self.assertTrue(ok)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pipeline.processes), 2)
+
+    def test_silent_capture_is_rejected_even_though_audio_keeps_flowing(self):
+        # The regression this guards: RTP kept leaving the box because audio
+        # was fine, so a dead video source looked healthy.
+        ok, errors, pipeline, procs = self._run([0, 0], min_bytes=1_000_000)
+        self.assertFalse(ok)
+        self.assertIn("produced no frames", errors[0])
+        self.assertEqual(pipeline.processes, [])
+        self.assertTrue(all(p.terminated for p in procs))
+
+    def test_partial_frame_is_not_enough(self):
+        ok, errors, _, _ = self._run([0, 4096], min_bytes=1_000_000)
+        self.assertFalse(ok)
+        self.assertIn("produced no frames", errors[0])
+
+    def test_dead_capture_process_is_rejected(self):
+        ok, errors, pipeline, _ = self._run([0, 5_000_000], producer_alive=False)
+        self.assertFalse(ok)
+        self.assertIn("capture pipeline exited", errors[0])
+        self.assertEqual(pipeline.processes, [])
+
+    def test_portal_fd_is_inherited_by_the_capture_process(self):
+        # subprocess closes everything above stderr, so without pass_fds the
+        # PipeWire fd is gone in the child and capture yields nothing (#84).
+        seen = {}
+
+        class Proc:
+            stdout = io.BytesIO()
+            pid = 1
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+        def fake_popen(cmd, *a, **kwargs):
+            if "stdout" in kwargs:
+                seen["pass_fds"] = kwargs.get("pass_fds")
+            return Proc()
+
+        config = wfd.WFDMediaConfig(monitor=None, aosp_pmt_pid=True)
+        pipeline = wfd.WFDMediaPipeline(config, tv_ip="10.42.0.2", local_ip="10.42.0.1",
+                                        sink_rtp_port=35034)
+        with (
+            mock.patch.object(wfd.subprocess, "Popen", side_effect=fake_popen),
+            patch_all("_process_written_bytes", return_value=None),
+            mock.patch.object(wfd.time, "sleep"),
+        ):
+            pipeline._spawn_capture_pipe(["gst"], ["ffmpeg"], [], "path", pass_fds=(42,))
+
+        self.assertEqual(seen.get("pass_fds"), (42,))
+
+    def test_unreadable_proc_io_does_not_block_startup(self):
+        # /proc may be unavailable; fall back to "process is alive".
+        ok, errors, _, _ = self._run([None, None], min_bytes=1_000_000)
+        self.assertTrue(ok)
+        self.assertEqual(errors, [])
+
+
+class TsDumpTest(unittest.TestCase):
+    def test_pipeline_is_untouched_without_a_dump_path(self):
+        self.assertEqual(
+            wfd._gst_rtp_link(None), ["!", "rtpmp2tpay", "pt=33", "mtu=1328"]
+        )
+        self.assertEqual(wfd._gst_dump_branch(None), [])
+        self.assertIsNone(wfd.WFDMediaConfig(monitor=None).dump_ts_path)
+
+    def test_dump_path_tees_the_muxer_output(self):
+        link = wfd._gst_rtp_link("/tmp/x.ts")
+        branch = wfd._gst_dump_branch("/tmp/x.ts")
+        self.assertEqual(link[:3], ["!", "tee", "name=tsdump"])
+        self.assertIn("rtpmp2tpay", link)
+        self.assertEqual(branch[0], "tsdump.")
+        self.assertIn("location=/tmp/x.ts", branch)
+
+
+class TsProbeTest(unittest.TestCase):
+    def test_sps_parser_reads_profile_level_and_size(self):
+        sps = bytes.fromhex("42c01e d8 0a 03 c9 fd 80 88 00 00 03 00 88 00 00 1e 47 8c 18 cd".replace(" ", ""))
+        info = ts_probe._parse_sps(ts_probe._unescape_rbsp(sps))
+        self.assertIsNotNone(info)
+        self.assertEqual(info.profile_idc, 66)
+        self.assertEqual(info.level_idc, 30)
+
+    def test_pcr_outside_the_declared_pcr_pid_is_reported(self):
+        report = ts_probe.TSReport(
+            pmt_pcr_pid=0x1000, pcr_count=4, pcr_pids={0x1000: 2, 0x0000: 1, 0x1011: 1}
+        )
+        text = ts_probe.format_report(report)
+        self.assertIn("PCR also on PIDs the PMT does not name", text)
+        self.assertIn("0x0000:1", text)
+        self.assertIn("0x1011:1", text)
+
+    def test_pcr_only_on_the_declared_pid_is_not_reported(self):
+        report = ts_probe.TSReport(pmt_pcr_pid=0x1011, pcr_count=2, pcr_pids={0x1011: 2})
+        self.assertNotIn("PCR also on PIDs", ts_probe.format_report(report))
+
+    def test_null_packets_do_not_count_as_continuity_errors(self):
+        # cc is deliberately frozen; nulls must not be flagged.
+        null = bytes([0x47, 0x1F, 0xFF, 0x10]) + b"\xff" * 184
+        path = os.path.join(os.path.dirname(__file__), "_ts_probe_null.ts")
+        with open(path, "wb") as handle:
+            handle.write(null * 40)
+        try:
+            report = ts_probe.analyze(path)
+            self.assertEqual(report.continuity_errors, {})
+            self.assertEqual(report.packets, 40)
+        finally:
+            os.unlink(path)
+
+
+class StartBackendDiagnosticsTest(unittest.TestCase):
+    def test_no_firewall_flag_is_forwarded_to_diagnostics(self):
+        args = SimpleNamespace(wfd_no_firewall=True)
+        report = SimpleNamespace(wfd_candidate=False)
+
+        with (
+            patch_all("run_diagnostics", return_value=report) as run,
+            patch_all("print_report"),
+            self.assertRaises(wfd.WFDNotReady),
+        ):
+            wfd.start_experimental_backend(args)
+
+        run.assert_called_once_with(skip_firewall=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
