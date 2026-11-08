@@ -137,7 +137,7 @@ _MODE_OPTIONS = {
         "wfd-timeout": _Option(_positive_int),
         "wfd-go-intent": _Option(_go_intent),
         "wfd-uibc": _Option(_boolean, is_flag=True),
-        "wfd-encoder": _Option(_choice("x264", "va")),
+        "wfd-encoder": _Option(_choice("x264", "openh264", "va")),
         "wfd-rate-control": _Option(_choice("vbr", "cbr", "qvbr")),
         "wfd-r2": _Option(_boolean, is_flag=True),
     },

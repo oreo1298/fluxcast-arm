@@ -407,7 +407,7 @@ class PortalGstElementsCheckTest(unittest.TestCase):
     def _everything(self):
         return (set(diagnostics.PORTAL_GST_VIDEO_ELEMENTS)
                 | set(diagnostics.PORTAL_GST_AUDIO_ELEMENTS)
-                | {"avenc_aac"})
+                | {"x264enc", "avenc_aac"})
 
     def test_reports_ok_and_names_the_chosen_aac_encoder(self):
         check = self._check(self._everything())
@@ -416,7 +416,8 @@ class PortalGstElementsCheckTest(unittest.TestCase):
         self.assertIn("AAC encoder: avenc_aac", check.detail)
 
     def test_audio_elements_and_the_encoder_drop_out_without_audio(self):
-        check = self._check(set(diagnostics.PORTAL_GST_VIDEO_ELEMENTS), no_audio=True)
+        check = self._check(set(diagnostics.PORTAL_GST_VIDEO_ELEMENTS) | {"x264enc"},
+                            no_audio=True)
         self.assertEqual(check.status, diagnostics.STATUS_OK)
         self.assertIn("9 of 9 present", check.detail)
         self.assertNotIn("AAC", check.detail)
@@ -449,6 +450,27 @@ class PortalGstElementsCheckTest(unittest.TestCase):
         check = self._check(present)
         self.assertIn("AAC encoder: fdkaacenc", check.detail)
 
+    def test_openh264enc_alone_satisfies_the_video_encoder(self):
+        """Stock Fedora / Fedora Asahi Remix has openh264enc and no x264enc."""
+        present = (self._everything() - {"x264enc"}) | {"openh264enc"}
+        check = self._check(present)
+        self.assertEqual(check.status, diagnostics.STATUS_OK)
+        self.assertIn("14 of 14 present", check.detail)
+        self.assertIn("H.264 encoder: openh264enc", check.detail)
+
+    def test_x264enc_is_reported_when_both_encoders_exist(self):
+        check = self._check(self._everything() | {"openh264enc"})
+        self.assertIn("H.264 encoder: x264enc", check.detail)
+
+    def test_a_missing_h264_encoder_is_one_requirement_not_two(self):
+        check = self._check(self._everything() - {"x264enc"})
+        self.assertEqual(check.status, diagnostics.STATUS_WARN)
+        self.assertIn("an H.264 encoder", check.message)
+        self.assertIn("missing 1 of 14", check.message)
+        self.assertIn("gstreamer1-plugin-openh264", check.detail)
+        for encoder in diagnostics.PORTAL_GST_H264_ENCODERS:
+            self.assertIn(encoder, check.detail)
+
     def test_unverifiable_elements_are_not_reported_as_missing(self):
         """A gst-inspect timeout must not tell users to install something they
         may already have."""
@@ -467,6 +489,7 @@ class PortalGstElementsCheckTest(unittest.TestCase):
 
     def test_every_element_has_an_install_hint(self):
         for element in (diagnostics.PORTAL_GST_VIDEO_ELEMENTS
+                        + diagnostics.PORTAL_GST_H264_ENCODERS
                         + diagnostics.PORTAL_GST_AUDIO_ELEMENTS
                         + diagnostics.PORTAL_GST_AAC_ENCODERS):
             self.assertIn(element, diagnostics._GST_ELEMENT_PACKAGES,
@@ -509,6 +532,61 @@ class PortalPreflightSharesTheDoctorListTest(unittest.TestCase):
         self.assertIn("PORTAL_GST_AAC_ENCODERS", source)
         self.assertEqual(set(gst._AAC_ENCODER_CAPS),
                          set(diagnostics.PORTAL_GST_AAC_ENCODERS))
+
+
+class AppleSiliconCheckTest(unittest.TestCase):
+    """The platform row only appears on Apple Silicon (Asahi Linux)."""
+
+    def _fake_system(self, root, compatible, model="", wifi=()):
+        dt = os.path.join(root, "dt")
+        net = os.path.join(root, "net")
+        os.makedirs(dt)
+        os.makedirs(net)
+        with open(os.path.join(dt, "compatible"), "wb") as f:
+            f.write(b"\0".join(c.encode() for c in compatible) + b"\0")
+        if model:
+            with open(os.path.join(dt, "model"), "wb") as f:
+                f.write(model.encode() + b"\0")
+        drivers = os.path.join(root, "drivers")
+        for iface, driver in wifi:
+            os.makedirs(os.path.join(net, iface, "wireless"))
+            os.makedirs(os.path.join(net, iface, "device"))
+            os.makedirs(os.path.join(drivers, driver), exist_ok=True)
+            os.symlink(os.path.join(drivers, driver),
+                       os.path.join(net, iface, "device", "driver"))
+        os.makedirs(os.path.join(net, "lo"))  # not wireless: ignored
+        return mock.patch.multiple(diagnostics, _DEVICE_TREE=dt, _SYS_NET=net)
+
+    def test_m1_macbook_air_is_described(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            with self._fake_system(root, ["apple,j313", "apple,t8103", "apple,arm-platform"],
+                                   model="Apple MacBook Air (M1, 2020)",
+                                   wifi=[("wlan0", "brcmfmac")]):
+                check = diagnostics._apple_silicon_check()
+        self.assertEqual(check.name, "platform")
+        self.assertEqual(check.status, diagnostics.STATUS_OK)
+        self.assertIn("MacBook Air (M1, 2020)", check.message)
+        self.assertIn("wlan0=brcmfmac", check.detail)
+        self.assertIn("--protocol dlna", check.detail)
+        self.assertIn("OpenH264", check.detail)
+
+    def test_other_machines_get_no_platform_row(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            with self._fake_system(root, ["raspberrypi,4-model-b", "brcm,bcm2711"]):
+                self.assertIsNone(diagnostics._apple_silicon_check())
+
+    def test_missing_device_tree_means_not_apple(self):
+        with mock.patch.multiple(diagnostics, _DEVICE_TREE="/nonexistent/dt"):
+            self.assertIsNone(diagnostics._apple_silicon_check())
+
+    def test_row_is_added_to_the_report_on_apple_silicon(self):
+        row = diagnostics.Check("platform", diagnostics.STATUS_OK, "Apple MacBook Air")
+        with mock.patch("diagnostics._firewall_check"), \
+                mock.patch("diagnostics._apple_silicon_check", return_value=row):
+            report = diagnostics.run_diagnostics(skip_firewall=True)
+        self.assertEqual(report.checks[1], row)
 
 
 class IwP2pCheckTest(unittest.TestCase):

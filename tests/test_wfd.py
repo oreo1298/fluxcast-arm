@@ -397,8 +397,13 @@ class AspectRatioTest(unittest.TestCase):
 
 def _gst_commands(size=(1080, 1920), encoder="x264", has_va=True, rate_control="qvbr",
                   dmabuf_fails=False, va_rate_controls=("cbr", "vbr", "qvbr"),
-                  source_type=1, pw_props=frozenset(), ffmpeg=False):
-    """Generated gst argv for every WFD pipeline that scales."""
+                  source_type=1, pw_props=frozenset(), ffmpeg=False,
+                  gst_missing=frozenset(), ffmpeg_encoders=frozenset({"libx264"})):
+    """Generated gst argv for every WFD pipeline that scales.
+
+    gst_missing lists elements gst-inspect cannot find (e.g. x264enc on stock
+    Fedora); ffmpeg_encoders is what `ffmpeg -encoders` lists.
+    """
     class Mon:
         name, width, height, x, y, display = "eDP-1", 1080, 1920, 0, 0, ":0"
 
@@ -448,7 +453,9 @@ def _gst_commands(size=(1080, 1920), encoder="x264", has_va=True, rate_control="
     pipeline.tx_interface = "lo"
     with (
         mock.patch.object(wfd.shutil, "which", side_effect=lambda n: "/usr/bin/" + n),
-        patch_all("_gst_has_element", side_effect=lambda n: has_va or n != "vah264enc"),
+        patch_all("_gst_has_element",
+                  side_effect=lambda n: (has_va or n != "vah264enc") and n not in gst_missing),
+        patch_all("_ffmpeg_encoders", return_value=ffmpeg_encoders),
         patch_all("_detect_audio_monitor", return_value="m"),
         patch_all("_gst_pipewiresrc_properties", return_value=set(pw_props)),
         patch_all("_gst_x264enc_properties", return_value=set()),
@@ -469,7 +476,7 @@ def _gst_commands(size=(1080, 1920), encoder="x264", has_va=True, rate_control="
         config.aosp_pmt_pid = True
         pipeline._start_desktop_portal_ffmpeg()
     if ffmpeg:
-        return [c for c in captured if "libx264" in c]
+        return [c for c in captured if c and c[0] == "ffmpeg"]
     return [c for c in captured if c and c[0].startswith("gst-launch")]
 
 
@@ -512,6 +519,113 @@ class PipewireBufferHandbackTest(unittest.TestCase):
         property unset rather than setting it either way."""
         for cmd in _gst_commands():
             self.assertNotIn("always-copy=false", cmd)
+
+
+class OpenH264FallbackTest(unittest.TestCase):
+    """Stock Fedora, and so Fedora Asahi Remix on Apple Silicon, ships
+    openh264enc and ffmpeg's libopenh264 but neither x264enc nor libx264.
+    Apple Silicon has no VA-API encoder either, so every pipeline has to be
+    able to run on OpenH264 alone."""
+
+    FEDORA = dict(gst_missing=frozenset({"x264enc", "vah264enc", "vacompositor"}),
+                  ffmpeg_encoders=frozenset({"libopenh264", "aac"}))
+
+    def _portal(self, **kwargs):
+        return next(c for c in _gst_commands(**kwargs)
+                    if "pipewiresrc" in c and "mpegtsmux" in c)
+
+    def _gst_x11(self, **kwargs):
+        return next(c for c in _gst_commands(**kwargs) if "ximagesrc" in c)
+
+    def test_portal_uses_openh264enc_without_x264enc(self):
+        portal = self._portal(**self.FEDORA)
+        self.assertNotIn("x264enc", portal)
+        enc = portal.index("openh264enc")
+        self.assertEqual(portal[enc - 2], "video/x-raw,format=I420")
+        # openh264enc takes bit/s, x264enc kbit/s.
+        bitrate = next(a for a in portal[enc:] if a.startswith("bitrate="))
+        self.assertGreaterEqual(int(bitrate.split("=")[1]), 1_000_000)
+        for arg in ("rate-control=bitrate", "enable-frame-skip=false", "gop-size=30",
+                    "slice-mode=n-slices"):
+            self.assertIn(arg, portal[enc:])
+        caps = next(a for a in portal[enc:] if a.startswith("video/x-h264"))
+        self.assertIn("profile=constrained-baseline", caps)
+
+    def test_x264enc_stays_the_default_when_both_exist(self):
+        portal = self._portal(gst_missing=frozenset())
+        self.assertIn("x264enc", portal)
+        self.assertNotIn("openh264enc", portal)
+
+    def test_openh264_can_be_asked_for_when_x264_exists(self):
+        portal = self._portal(encoder="openh264", has_va=False)
+        self.assertIn("openh264enc", portal)
+        self.assertNotIn("x264enc", portal)
+
+    def test_va_falls_back_to_openh264enc_on_apple_silicon(self):
+        portal = self._portal(encoder="va", **self.FEDORA)
+        self.assertIn("openh264enc", portal)
+        self.assertNotIn("vah264enc", portal)
+        self.assertNotIn("video/x-raw(memory:DMABuf)", portal)
+
+    def test_gst_x11_uses_openh264enc_without_x264enc(self):
+        cmd = self._gst_x11(**self.FEDORA)
+        self.assertNotIn("x264enc", cmd)
+        enc = cmd.index("openh264enc")
+        caps = next(a for a in cmd[enc:] if a.startswith("video/x-h264"))
+        self.assertIn("profile=constrained-baseline", caps)
+
+    def test_ffmpeg_path_uses_libopenh264_without_libx264(self):
+        cmds = _gst_commands(ffmpeg=True, **self.FEDORA)
+        self.assertTrue(cmds)
+        for cmd in cmds:
+            self.assertEqual(cmd[cmd.index("-c:v") + 1], "libopenh264")
+            self.assertEqual(cmd[cmd.index("-profile:v") + 1], "constrained_baseline")
+            self.assertEqual(cmd[cmd.index("-rc_mode") + 1], "bitrate")
+            self.assertEqual(cmd[cmd.index("-allow_skip_frames") + 1], "0")
+            self.assertEqual(cmd[cmd.index("-slices") + 1], cmd[cmd.index("-threads") + 1])
+            # x264-only options would make ffmpeg refuse to start.
+            for x264_only in ("-x264-params", "-preset", "-tune", "-level:v"):
+                self.assertNotIn(x264_only, cmd)
+
+    def test_ffmpeg_path_keeps_libx264_when_ffmpeg_cannot_be_asked(self):
+        cmds = _gst_commands(ffmpeg=True, ffmpeg_encoders=None)
+        for cmd in cmds:
+            self.assertEqual(cmd[cmd.index("-c:v") + 1], "libx264")
+
+    def test_preflight_names_both_encoders_when_neither_exists(self):
+        with self.assertRaises(wfd.WFDNotReady) as ctx:
+            self._portal(gst_missing=frozenset({"x264enc", "openh264enc"}))
+        self.assertIn("x264enc or openh264enc", str(ctx.exception))
+
+    def test_picker_order_matches_what_the_doctor_reports(self):
+        import diagnostics
+        from wfd import h264
+        self.assertEqual(tuple(h264._GST_ELEMENTS.values()),
+                         diagnostics.PORTAL_GST_H264_ENCODERS)
+
+    def test_ffmpeg_encoder_list_is_parsed(self):
+        from wfd import h264
+        listing = (
+            "Encoders:\n"
+            " V..... = Video\n"
+            " ------\n"
+            " V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC (codec h264)\n"
+            " A....D aac                  AAC (Advanced Audio Coding)\n"
+        )
+        result = subprocess.CompletedProcess([], 0, stdout=listing, stderr="")
+        with mock.patch.dict(h264._ffmpeg_list_cache, clear=True), \
+                mock.patch.object(h264.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+                mock.patch.object(h264.subprocess, "run", return_value=result):
+            self.assertEqual(h264._ffmpeg_encoders(), frozenset({"libopenh264", "aac"}))
+            self.assertEqual(h264._ffmpeg_h264_encoder(), "libopenh264")
+
+    def test_missing_ffmpeg_is_unknown_not_empty(self):
+        from wfd import h264
+        with mock.patch.dict(h264._ffmpeg_list_cache, clear=True), \
+                mock.patch.object(h264.shutil, "which", return_value=None):
+            self.assertIsNone(h264._ffmpeg_encoders())
+            self.assertEqual(h264._ffmpeg_h264_encoder(), "libx264")
+            self.assertEqual(h264._ffmpeg_h264_encoder("openh264"), "libopenh264")
 
 
 class PortalVaEncoderTest(unittest.TestCase):

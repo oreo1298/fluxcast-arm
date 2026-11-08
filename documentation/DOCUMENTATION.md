@@ -60,7 +60,7 @@ python3 src/main.py --protocol cast
 - `--wfd-media-pipeline auto|ffmpeg|gst`
 - `--wfd-capture-backend auto|portal|wf-recorder|x11grab|gst-x11`
   - `auto` uses `portal` first on KDE/GNOME Wayland, then `wf-recorder` fallback.
-- `--wfd-encoder x264|va`
+- `--wfd-encoder x264|openh264|va`
 - `--wfd-rate-control vbr|cbr|qvbr`
 - `--wfd-latency-log [PATH]`
 - `--wfd-aosp-pmt-pid` write MPEG-TS tables the way Android (AOSP) sinks expect them
@@ -249,14 +249,15 @@ and protocol selection remain controlled by the tray and cannot be set here.
   - `portal`: Wayland ScreenCast through xdg-desktop-portal (KDE/GNOME preferred path).
   - `wf-recorder`: recommended on Hyprland/wlroots.
   - `x11grab`: useful for X11 sessions.
-  - `gst-x11`: X11 capture routed through the GStreamer MPEG-TS pipeline (the same one the test pattern uses) instead of ffmpeg. Opt-in and never chosen by `auto`. Use it when a sink connects and streams but shows a black screen on the default ffmpeg path (confirmed on Hisense Vidaa). Requires `gst-launch-1.0`, `ximagesrc` (gst-plugins-good), and `x264enc` (gst-plugins-ugly).
+  - `gst-x11`: X11 capture routed through the GStreamer MPEG-TS pipeline (the same one the test pattern uses) instead of ffmpeg. Opt-in and never chosen by `auto`. Use it when a sink connects and streams but shows a black screen on the default ffmpeg path (confirmed on Hisense Vidaa). Requires `gst-launch-1.0`, `ximagesrc` (gst-plugins-good), and `x264enc` (gst-plugins-ugly) or `openh264enc` (gst-plugins-bad with libopenh264).
   - `portal` backend requirements: `dbus-next`, `xdg-desktop-portal`, desktop portal backend, and `gst-launch-1.0`.
 - `--wfd-encoder`
-  - H.264 encoder for the `portal` backend. Other backends ignore it.
-  - `x264` (default): software `x264enc`.
-  - `va`: GPU encoding through VA-API `vah264enc` (gst-plugins-bad), which uses far less CPU. Needs a VA-API driver with H.264 encode; on Fedora that is RPM Fusion's `intel-media-driver`, since Fedora's `libva-intel-media-driver` has no H.264. Falls back to `x264` when `vah264enc` is not available.
+  - H.264 encoder. `va` only applies to the `portal` backend; `x264` and `openh264` choose between the two software encoders on every backend (GStreamer `x264enc`/`openh264enc`, ffmpeg `libx264`/`libopenh264`).
+  - `x264` (default): software x264. Falls back to OpenH264 when x264 is not installed, which is the case on stock Fedora and Fedora Asahi Remix (x264 lives in RPM Fusion there).
+  - `openh264`: software Cisco OpenH264 (Constrained Baseline, the profile FluxCast negotiates anyway). Falls back to x264 when OpenH264 is missing. On Fedora: `gstreamer1-plugin-openh264` and `openh264` from the `fedora-cisco-openh264` repository; Fedora's `ffmpeg-free` already includes `libopenh264`.
+  - `va`: GPU encoding through VA-API `vah264enc` (gst-plugins-bad), which uses far less CPU. Needs a VA-API driver with H.264 encode; on Fedora that is RPM Fusion's `intel-media-driver`, since Fedora's `libva-intel-media-driver` has no H.264. Falls back to the software encoders above when `vah264enc` is not available - always the case on Apple Silicon (Asahi Linux), which has no hardware encoder support.
 - `--wfd-rate-control`
-  - Rate control for `--wfd-encoder va`. Ignored by `x264`.
+  - Rate control for `--wfd-encoder va`. Ignored by `x264` and `openh264`.
   - `qvbr` (default): constant quality, up to `--bitrate`. Keeps keyframes close to x264's size; falls back to `vbr` when the VA driver does not offer it.
   - `vbr`: sends only what the picture needs, up to `--bitrate`. On Intel, keyframes of a static desktop can grow to ~300 KiB, which a weak Wi-Fi Direct link may drop, leaving the TV loading.
   - `cbr`: always sends the full `--bitrate`, padding frames that need less.

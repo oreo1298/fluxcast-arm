@@ -6,10 +6,10 @@ from ..config import WFDNotReady
 from ..wf_recorder import find_wf_recorder
 from ..encoding import (
     _bitrate_to_kbits, _calculate_gop, _kbits_to_bitrate_text, _letterbox_vf,
-    _effective_kbits, _parse_resolution, _vbv_bufsize, _x264_threads,
+    _effective_kbits, _parse_resolution, _vbv_bufsize,
 )
 from ..env import _detect_audio_monitor
-from ..modes import _h264_level_for_mode
+from ..h264 import _ffmpeg_video_encoder_args
 from ..net import _ffmpeg_sender_args
 
 
@@ -73,24 +73,10 @@ class WlrootsMixin:
         else:
             ffmpeg_cmd += ["-vf", _letterbox_vf(out_res)]
 
-        ffmpeg_cmd += [
-            "-c:v", "libx264",
-            "-preset", "ultrafast" if parsed_out[1] > 1080 else "veryfast",
-            "-tune", "zerolatency",
-            "-threads", str(_x264_threads()),
-            "-profile:v", self.config.h264_profile,
-            "-level:v", _h264_level_for_mode(self.config),
-            "-pix_fmt", "yuv420p",
-            "-r", str(self.config.fps),
-            "-g", str(gop),
-            "-keyint_min", str(gop),
-            "-sc_threshold", "0",
-            "-bf", "0",
-            "-b:v", effective_bitrate,
-            "-maxrate", effective_bitrate,
-            "-bufsize", _vbv_bufsize(effective_bitrate, self.config),
-            "-x264-params", "repeat-headers=1:aud=1",
-        ]
+        ffmpeg_cmd += _ffmpeg_video_encoder_args(
+            self.config, height=parsed_out[1], gop=gop, bitrate=effective_bitrate,
+            bufsize=_vbv_bufsize(effective_bitrate, self.config),
+        )
 
         if not self.config.no_audio:
             ffmpeg_cmd += [

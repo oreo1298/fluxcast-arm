@@ -7,7 +7,9 @@ import time
 from capture.portal_capture import (
     PortalCaptureError, close_portal_capture, start_portal_capture,
 )
-from diagnostics import PORTAL_GST_AUDIO_ELEMENTS, PORTAL_GST_VIDEO_ELEMENTS
+from diagnostics import (
+    PORTAL_GST_AUDIO_ELEMENTS, PORTAL_GST_H264_ENCODERS, PORTAL_GST_VIDEO_ELEMENTS,
+)
 from ..config import WFDNotReady
 from ..dump import _process_written_bytes
 from ..encoding import (
@@ -20,7 +22,10 @@ from ..gst import (
     _gst_pipewiresrc_properties, _gst_rtp_link, _gst_vah264enc_rate_controls,
     _gst_x264enc_properties, _pipewiresrc_selector_attempts, _wfd_gst_prog_map,
 )
-from ..modes import _h264_level_for_mode
+from ..h264 import (
+    _ffmpeg_video_encoder_args, _gst_h264_caps_profile, _gst_openh264enc_args,
+    _gst_pick_h264_encoder,
+)
 from ..net import _ffmpeg_sender_args
 
 
@@ -143,24 +148,10 @@ class PortalMixin:
                                   "setsar=1,format=yuv420p"]
         else:
             ffmpeg_cmd += ["-vf", "format=yuv420p"]
-        ffmpeg_cmd += [
-            "-c:v", "libx264",
-            "-preset", "ultrafast" if out_h > 1080 else "veryfast",
-            "-tune", "zerolatency",
-            "-threads", str(_x264_threads()),
-            "-profile:v", self.config.h264_profile,
-            "-level:v", _h264_level_for_mode(self.config),
-            "-pix_fmt", "yuv420p",
-            "-r", str(self.config.fps),
-            "-g", str(gop),
-            "-keyint_min", str(gop),
-            "-sc_threshold", "0",
-            "-bf", "0",
-            "-b:v", effective_bitrate,
-            "-maxrate", effective_bitrate,
-            "-bufsize", _vbv_bufsize(effective_bitrate, self.config),
-            "-x264-params", "repeat-headers=1:aud=1",
-        ]
+        ffmpeg_cmd += _ffmpeg_video_encoder_args(
+            self.config, height=out_h, gop=gop, bitrate=effective_bitrate,
+            bufsize=_vbv_bufsize(effective_bitrate, self.config),
+        )
         if not self.config.no_audio:
             ffmpeg_cmd += [
                 "-af", "aresample=async=1",
@@ -262,6 +253,8 @@ class PortalMixin:
             required += PORTAL_GST_AUDIO_ELEMENTS
         missing = [name for name in required
                    if not _gst_has_element(name)]
+        if _gst_pick_h264_encoder(self.config.encoder) is None:
+            missing.append("an H.264 encoder (" + " or ".join(PORTAL_GST_H264_ENCODERS) + ")")
         if missing:
             raise WFDNotReady(
                 "Portal backend is missing required GStreamer elements: "
@@ -322,33 +315,22 @@ class PortalMixin:
         has_h264parse = _gst_has_element("h264parse")
         use_va = (self.config.encoder == "va" and _gst_has_element("vah264enc")
                   and _gst_has_element("vacompositor"))
+        # The preflight above made sure one of them exists.
+        sw_encoder = _gst_pick_h264_encoder(self.config.encoder) or "x264enc"
         if self.config.encoder == "va" and not use_va:
-            print("[FluxCast WFD Media] vah264enc/vacompositor not available; falling back to x264enc.")
+            print("[FluxCast WFD Media] vah264enc/vacompositor not available; "
+                  f"falling back to {sw_encoder}.")
+        elif self.config.encoder in ("x264", "openh264") and \
+                not sw_encoder.startswith(self.config.encoder):
+            print(f"[FluxCast WFD Media] {self.config.encoder} encoder not available; "
+                  f"using {sw_encoder}.")
+        use_openh264 = not use_va and sw_encoder == "openh264enc"
         rate_control = self.config.rate_control
         if use_va and rate_control not in _gst_vah264enc_rate_controls():
             print(f"[FluxCast WFD Media] vah264enc does not offer {rate_control} on this driver; using vbr.")
             rate_control = "vbr"
 
-        def _gst_video_chain(video_caps: str, selector_args: list[str],
-                             dmabuf: bool = False) -> list[str]:
-            # Use more buffers for high-res 1440p capture and move videorate early
-            props = _gst_pipewiresrc_properties()
-            pipewire_args = [*selector_args]
-            if "max-buffers" in props:
-                pipewire_args.append("max-buffers=64")
-            if "resend-last" in props:
-                pipewire_args.append("resend-last=true")
-            if "min-force-user-latency" in props:
-                pipewire_args.append("min-force-user-latency=0")
-            if follow_window and "provide-clock" in props:
-                # Resizing a window renegotiates the stream. pipewiresrc's clock
-                # stops while KWin does that, and the source waits on it for
-                # seconds before passing on a frame. pulsesrc (or the system
-                # clock) keeps running and keeps audio and video in step.
-                pipewire_args.append("provide-clock=false")
-
-            is_lg = "LG" in self.config.peer_name.upper()
-
+        def _x264enc_args(is_lg: bool) -> list[str]:
             # x264enc configuration
             encoder_args = [
                 "tune=zerolatency",
@@ -411,6 +393,32 @@ class PortalMixin:
 
             if opt_parts:
                 encoder_args.append("option-string=" + ":".join(opt_parts))
+            return encoder_args
+
+        def _gst_video_chain(video_caps: str, selector_args: list[str],
+                             dmabuf: bool = False) -> list[str]:
+            # Use more buffers for high-res 1440p capture and move videorate early
+            props = _gst_pipewiresrc_properties()
+            pipewire_args = [*selector_args]
+            if "max-buffers" in props:
+                pipewire_args.append("max-buffers=64")
+            if "resend-last" in props:
+                pipewire_args.append("resend-last=true")
+            if "min-force-user-latency" in props:
+                pipewire_args.append("min-force-user-latency=0")
+            if follow_window and "provide-clock" in props:
+                # Resizing a window renegotiates the stream. pipewiresrc's clock
+                # stops while KWin does that, and the source waits on it for
+                # seconds before passing on a frame. pulsesrc (or the system
+                # clock) keeps running and keeps audio and video in step.
+                pipewire_args.append("provide-clock=false")
+
+            is_lg = "LG" in self.config.peer_name.upper()
+
+            if use_openh264:
+                encoder_args = _gst_openh264enc_args(bitrate_kbits, gop, parsed_out[1])
+            elif not use_va:
+                encoder_args = _x264enc_args(is_lg)
 
             # Inject in-band SPS/PPS before every IDR (mirrors ffmpeg repeat-headers=1).
             h264_parse_chain = ["!", "h264parse", "config-interval=-1"] if has_h264parse else []
@@ -442,17 +450,23 @@ class PortalMixin:
                     "b-frames=0",
                     "aud=true",
                 ]
+            elif use_openh264:
+                # _gst_openh264enc_args starts with the element name itself.
+                encoder_chain = [
+                    "!", "imagefreeze", "is-live=true", "allow-replace=true",
+                    "!", "capsfilter", f"caps=video/x-raw,framerate={self.config.fps}/1",
+                    "!", "video/x-raw,format=I420", "!", *encoder_args,
+                ]
             else:
                 encoder_chain = [
                     "!", "imagefreeze", "is-live=true", "allow-replace=true",
                     "!", "capsfilter", f"caps=video/x-raw,framerate={self.config.fps}/1",
                     "!", "video/x-raw,format=I420", "!", "x264enc", *encoder_args,
                 ]
-            # x264enc's "baseline" output is Constrained Baseline; vah264enc
-            # only negotiates that profile under its exact name.
-            caps_profile = self.config.h264_profile
-            if use_va and caps_profile == "baseline":
-                caps_profile = "constrained-baseline"
+            # x264enc's "baseline" output is Constrained Baseline; vah264enc and
+            # openh264enc only negotiate that profile under its exact name.
+            caps_profile = _gst_h264_caps_profile(
+                "vah264enc" if use_va else sw_encoder, self.config.h264_profile)
 
             if dmabuf:
                 # Zero-copy: vapostproc converts and scales KWin's DMABuf on the
@@ -577,7 +591,7 @@ class PortalMixin:
             + ", ".join(name for name, _ in selector_attempts)
         )
         print("[FluxCast WFD Media] Pipeline             : gstreamer (portal->rtp)")
-        print(f"[FluxCast WFD Media] Video encoder        : {'vah264enc (VA-API)' if use_va else 'x264enc'}")
+        print(f"[FluxCast WFD Media] Video encoder        : {'vah264enc (VA-API)' if use_va else sw_encoder}")
         print(f"[FluxCast WFD Media] Portal source type      : {session.source_type}")
         if session.position and session.size:
             print(

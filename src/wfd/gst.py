@@ -52,7 +52,8 @@ def _gst_wfd_sender_available() -> bool:
         shutil.which("gst-launch-1.0") is not None
         and _gst_has_element("mpegtsmux")
         and _gst_has_element("rtpmp2tpay")
-        and _gst_has_element("x264enc")
+        # Fedora (and Fedora Asahi Remix) ships openh264enc but not x264enc.
+        and (_gst_has_element("x264enc") or _gst_has_element("openh264enc"))
     )
 
 def _gst_vah264enc_rate_controls() -> set[str]:

@@ -35,8 +35,13 @@ _GST_BAD_PACKAGES = ("gstreamer1.0-plugins-bad (Arch: gst-plugins-bad; "
 # reverse, so the shared copy lives on this side.
 PORTAL_GST_VIDEO_ELEMENTS = (
     "pipewiresrc", "videoconvert", "videoscale", "videorate", "imagefreeze",
-    "x264enc", "mpegtsmux", "rtpmp2tpay", "udpsink",
+    "mpegtsmux", "rtpmp2tpay", "udpsink",
 )
+# Software H.264 encoders, tried in this order by wfd.h264._gst_pick_h264_encoder
+# (the default --wfd-encoder x264); exactly one is needed. openh264enc is what
+# stock Fedora, and so Fedora Asahi Remix on Apple Silicon, ships; x264enc
+# needs RPM Fusion there.
+PORTAL_GST_H264_ENCODERS = ("x264enc", "openh264enc")
 PORTAL_GST_AUDIO_ELEMENTS = (
     "pulsesrc", "audioconvert", "audioresample", "aacparse",
 )
@@ -64,8 +69,11 @@ _GST_ELEMENT_PACKAGES = {
     "voaacenc": _GST_BAD_PACKAGES,
     "x264enc": "gstreamer1.0-plugins-ugly (Arch: gst-plugins-ugly; "
                "Fedora: gstreamer1-plugins-ugly, RPM Fusion)",
+    "openh264enc": "gstreamer1.0-plugins-bad (Arch: gst-plugins-bad + libopenh264; "
+                   "Fedora: gstreamer1-plugin-openh264 + openh264, "
+                   "fedora-cisco-openh264 repo)",
     "avenc_aac": "gstreamer1.0-libav (Arch: gst-libav; "
-                 "Fedora: gstreamer1-libav, RPM Fusion)",
+                 "Fedora: gstreamer1-plugin-libav)",
     "fdkaacenc": "gstreamer1.0-fdkaac (Arch: gst-plugins-bad; "
                  "Fedora: gstreamer1-plugins-bad-free)",
     "faac": "not packaged for Debian/Ubuntu (Arch: gst-plugins-bad)",
@@ -171,6 +179,8 @@ def _wf_recorder_check() -> Check:
 
 # Stands in for "any one of PORTAL_GST_AAC_ENCODERS" in the missing list.
 _AAC_ENCODER_LABEL = "an AAC encoder"
+# Stands in for "any one of PORTAL_GST_H264_ENCODERS" in the missing list.
+_H264_ENCODER_LABEL = "an H.264 encoder"
 
 
 def _gst_element_present(gst_inspect: str, element: str) -> Optional[bool]:
@@ -189,6 +199,10 @@ def _gst_install_hint(elements: list[str]) -> str:
         if element == _AAC_ENCODER_LABEL:
             package = (f"any of {', '.join(PORTAL_GST_AAC_ENCODERS)} - "
                        f"{_GST_ELEMENT_PACKAGES['avenc_aac']} is the most widely available")
+        elif element == _H264_ENCODER_LABEL:
+            package = (f"any of {', '.join(PORTAL_GST_H264_ENCODERS)} - "
+                       + " or ".join(_GST_ELEMENT_PACKAGES[e]
+                                     for e in PORTAL_GST_H264_ENCODERS))
         else:
             package = _GST_ELEMENT_PACKAGES.get(element, "unknown package")
         by_package.setdefault(package, []).append(element)
@@ -202,13 +216,14 @@ def _portal_gst_elements_check(no_audio: bool = False) -> Check:
     The backend preflight reads the same tuples from this module, so the report
     and the runtime requirement cannot drift apart again (#129). The AAC encoder
     counts as one requirement satisfied by any of several elements, which is how
-    _gst_pick_aac_encoder resolves it.
+    _gst_pick_aac_encoder resolves it. The H.264 encoder is the same kind of
+    requirement: x264enc or openh264enc, whichever wfd.h264 would pick.
     """
     name = "portal gst elements"
     required = list(PORTAL_GST_VIDEO_ELEMENTS)
     if not no_audio:
         required += list(PORTAL_GST_AUDIO_ELEMENTS)
-    total = len(required) + (0 if no_audio else 1)
+    total = len(required) + 1 + (0 if no_audio else 1)
 
     gst_inspect = shutil.which("gst-inspect-1.0")
     if not gst_inspect:
@@ -216,7 +231,7 @@ def _portal_gst_elements_check(no_audio: bool = False) -> Check:
             name, STATUS_WARN,
             f"none of the {total} elements the portal backend needs could be verified",
             "gst-inspect-1.0 not found; install gstreamer1.0-tools "
-            "(Arch: gstreamer; Fedora: gstreamer1-plugins-base-tools)",
+            "(Arch: gstreamer; Fedora: gstreamer1)",
         )
 
     missing: list[str] = []
@@ -227,6 +242,14 @@ def _portal_gst_elements_check(no_audio: bool = False) -> Check:
             unverified.append(element)
         elif not present:
             missing.append(element)
+
+    chosen_video_encoder = ""
+    for encoder in PORTAL_GST_H264_ENCODERS:
+        if _gst_element_present(gst_inspect, encoder):
+            chosen_video_encoder = encoder
+            break
+    else:
+        missing.append(_H264_ENCODER_LABEL)
 
     chosen_encoder = ""
     if not no_audio:
@@ -256,7 +279,7 @@ def _portal_gst_elements_check(no_audio: bool = False) -> Check:
             "gst-inspect-1.0 did not answer; the portal backend may still fail to start",
         )
 
-    detail = f"{total} of {total} present"
+    detail = f"{total} of {total} present; H.264 encoder: {chosen_video_encoder}"
     if chosen_encoder:
         detail += f"; AAC encoder: {chosen_encoder}"
     return Check(name, STATUS_OK, "Wayland portal GStreamer pipeline", detail)
@@ -295,6 +318,8 @@ def _ffmpeg_encoders() -> Check:
     encoders = result.stdout + result.stderr
     h264_candidates = [
         "libx264",
+        # Fedora's ffmpeg-free has this rather than libx264 (fedora-cisco-openh264).
+        "libopenh264",
         "h264_vaapi",
         "h264_nvenc",
         "h264_qsv",
@@ -321,7 +346,7 @@ def _ffmpeg_encoders() -> Check:
         "ffmpeg encoders",
         STATUS_FAIL,
         "no usable H.264 encoder detected",
-        "need libx264 or a hardware H.264 encoder",
+        "need libx264, libopenh264 or a hardware H.264 encoder",
     )
 
 
@@ -990,6 +1015,72 @@ def _python_check() -> Check:
     )
 
 
+_DEVICE_TREE = "/proc/device-tree"
+_SYS_NET = "/sys/class/net"
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "rb") as file:
+            return file.read().replace(b"\0", b"\n").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def _wifi_drivers() -> list[tuple[str, str]]:
+    """(interface, kernel driver) for every wireless netdev."""
+    found: list[tuple[str, str]] = []
+    try:
+        names = sorted(os.listdir(_SYS_NET))
+    except OSError:
+        return found
+    for name in names:
+        base = os.path.join(_SYS_NET, name)
+        if not os.path.isdir(os.path.join(base, "wireless")):
+            continue
+        try:
+            driver = os.path.basename(os.readlink(os.path.join(base, "device", "driver")))
+        except OSError:
+            driver = "unknown"
+        found.append((name, driver))
+    return found
+
+
+def _apple_silicon_check() -> Optional[Check]:
+    """Facts that matter on an Apple Silicon Mac running Asahi Linux.
+
+    None elsewhere, so the report on other machines is unchanged. Nothing here
+    blocks a session; it explains what the other rows will show:
+      - there is no hardware H.264 encoder (Apple's is not driven under Linux
+        and the GPU driver has no VA-API encode), so --wfd-encoder va always
+        falls back to x264 or OpenH264 on the CPU;
+      - the built-in Wi-Fi is a Broadcom chip on brcmfmac, whose Wi-Fi Direct
+        support on these firmwares is unconfirmed - the `iw P2P` row is the
+        real answer, and DLNA over the normal Wi-Fi works either way;
+      - Asahi kernels use 16K pages, which some prebuilt binaries cannot run on.
+    """
+    compatible = _read_text(os.path.join(_DEVICE_TREE, "compatible"))
+    if not any(entry.startswith("apple,") for entry in compatible.split()):
+        return None
+    model = _read_text(os.path.join(_DEVICE_TREE, "model")) or "Apple Silicon Mac"
+    try:
+        page_kib = os.sysconf("SC_PAGE_SIZE") // 1024
+    except (ValueError, OSError, AttributeError):
+        page_kib = 0
+    wifi = _wifi_drivers()
+    wifi_text = ", ".join(f"{name}={driver}" for name, driver in wifi) or "no Wi-Fi interface"
+    detail = (
+        "no hardware H.264 encoder under Linux: x264 or OpenH264 encodes on the CPU "
+        "and --wfd-encoder va falls back to them; "
+        f"Wi-Fi: {wifi_text} - if the `iw P2P` row is not ok, Wi-Fi Direct is not "
+        "available on the built-in chip, so use --protocol dlna over your normal "
+        "Wi-Fi or a P2P-capable USB adapter for WFD"
+    )
+    if page_kib:
+        detail += f"; page size {page_kib}K"
+    return Check("platform", STATUS_OK, f"{model} (Asahi Linux)", detail)
+
+
 def _p2p_row_is_evidence(check: Check) -> bool:
     """Whether the `iw P2P` row proves the kernel exposes Wi-Fi Direct.
 
@@ -1039,6 +1130,9 @@ def run_diagnostics(skip_firewall: bool = False) -> DiagnosticReport:
         _wpa_dbus_set_check(),
         firewall_check,
     ]
+    platform_check = _apple_silicon_check()
+    if platform_check is not None:
+        checks.insert(1, platform_check)
 
     by_name = {check.name: check for check in checks}
     network_hw_ok = (

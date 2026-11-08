@@ -6,14 +6,17 @@ import time
 from ..config import WFDNotReady
 from ..encoding import (
     _bitrate_to_kbits, _calculate_gop, _kbits_to_bitrate_text, _letterbox_vf,
-    _effective_kbits, _parse_resolution, _vbv_bufsize, _x264_threads,
+    _effective_kbits, _parse_resolution, _vbv_bufsize,
 )
 from ..env import _detect_audio_monitor
 from ..gst import (
     _gst_dump_branch, _gst_has_element, _gst_pick_aac_encoder, _gst_rtp_link,
     _wfd_gst_prog_map,
 )
-from ..modes import _h264_level_for_mode
+from ..h264 import (
+    _ffmpeg_video_encoder_args, _gst_h264_caps_profile, _gst_h264_encoder_chain,
+    _gst_pick_h264_encoder,
+)
 from ..net import _ffmpeg_sender_args
 
 
@@ -64,24 +67,10 @@ class X11Mixin:
         else:
             ffmpeg_cmd += ["-vf", _letterbox_vf(out_res)]
 
-        ffmpeg_cmd += [
-            "-c:v", "libx264",
-            "-preset", "ultrafast" if parsed_out[1] > 1080 else "veryfast",
-            "-tune", "zerolatency",
-            "-threads", str(_x264_threads()),
-            "-profile:v", self.config.h264_profile,
-            "-level:v", _h264_level_for_mode(self.config),
-            "-pix_fmt", "yuv420p",
-            "-r", str(self.config.fps),
-            "-g", str(gop),
-            "-keyint_min", str(gop),
-            "-sc_threshold", "0",
-            "-bf", "0",
-            "-b:v", effective_bitrate,
-            "-maxrate", effective_bitrate,
-            "-bufsize", _vbv_bufsize(effective_bitrate, self.config),
-            "-x264-params", "repeat-headers=1:aud=1",
-        ]
+        ffmpeg_cmd += _ffmpeg_video_encoder_args(
+            self.config, height=parsed_out[1], gop=gop, bitrate=effective_bitrate,
+            bufsize=_vbv_bufsize(effective_bitrate, self.config),
+        )
 
         if not self.config.no_audio:
             ffmpeg_cmd += [
@@ -126,14 +115,18 @@ class X11Mixin:
             raise WFDNotReady("gst-x11 backend requires a selected monitor.")
 
         required = ["ximagesrc", "videoconvert", "videoscale",
-                    "x264enc", "mpegtsmux", "rtpmp2tpay", "udpsink"]
+                    "mpegtsmux", "rtpmp2tpay", "udpsink"]
         if not self.config.no_audio:
             required += ["pulsesrc", "audioconvert", "audioresample", "aacparse"]
         missing = [name for name in required if not _gst_has_element(name)]
+        video_encoder = _gst_pick_h264_encoder(self.config.encoder)
+        if video_encoder is None:
+            missing.append("x264enc or openh264enc")
         if missing:
             raise WFDNotReady(
                 "gst-x11 backend is missing GStreamer elements: " + ", ".join(missing)
-                + " (ximagesrc/videoscale are in gst-plugins-good, x264enc in gst-plugins-ugly)."
+                + " (ximagesrc/videoscale are in gst-plugins-good, x264enc in gst-plugins-ugly,"
+                " openh264enc in gst-plugins-bad with libopenh264)."
             )
 
         src_w, src_h = monitor.width, monitor.height
@@ -184,18 +177,9 @@ class X11Mixin:
             "!", f"video/x-raw,width={out_w},height={out_h},pixel-aspect-ratio=1/1",
             "!", "videoconvert",
             "!", "video/x-raw,format=I420",
-            "!", "x264enc",
-            "tune=zerolatency",
-            f"speed-preset={'ultrafast' if out_h > 1080 else 'veryfast'}",
-            f"bitrate={bitrate_kbits}",
-            f"key-int-max={gop}",
-            "bframes=0",
-            "byte-stream=true",
-            "aud=true",
-            f"threads={_x264_threads()}",
-            "sliced-threads=true",
-            "vbv-buf-capacity=200",
-            "!", f"video/x-h264,stream-format=byte-stream,alignment=au,profile={self.config.h264_profile}",
+            "!", *_gst_h264_encoder_chain(video_encoder, bitrate_kbits, gop, out_h),
+            "!", "video/x-h264,stream-format=byte-stream,alignment=au,"
+                 f"profile={_gst_h264_caps_profile(video_encoder, self.config.h264_profile)}",
             "!", "queue",
             "!", "mux.sink_4113",
         ]

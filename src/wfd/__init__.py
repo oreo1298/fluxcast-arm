@@ -67,6 +67,7 @@ from .gst import _gst_has_element, _wfd_gst_prog_map, _gst_rtp_link, _gst_dump_b
 
 
 
+from .h264 import _gst_pick_h264_encoder, _gst_h264_caps_profile, _gst_openh264enc_args, _gst_h264_encoder_chain, _ffmpeg_encoders, _ffmpeg_h264_encoder, _ffmpeg_video_encoder_args
 from .dump import _process_written_bytes, _ts_dump_reported, report_ts_dump, schedule_ts_dump_report
 
 

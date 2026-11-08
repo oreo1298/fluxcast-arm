@@ -286,6 +286,17 @@ def _start_capture_wf_recorder(
     audio_monitor = _default_audio_monitor()
     hls_dir = _prepare_capture_hls_dir()
 
+    # Deferred: wfd imports capture, so a top-level import would cycle.
+    # wf-recorder encodes with the same libavcodec the system ffmpeg uses, so
+    # ffmpeg's encoder list says what it has (no libx264 on stock Fedora).
+    from wfd.h264 import _ffmpeg_h264_encoder
+    if _ffmpeg_h264_encoder() == "libopenh264":
+        codec_args = ["-c", "libopenh264", "-p", "profile=constrained_baseline",
+                      "-p", "rc_mode=bitrate", "-p", f"b={bitrate}"]
+    else:
+        codec_args = ["-c", "libx264", "-p", "preset=ultrafast", "-p", "tune=zerolatency",
+                      "-p", "profile=main"]
+
     cmd = [
         "wf-recorder",
         "-y",
@@ -294,17 +305,14 @@ def _start_capture_wf_recorder(
         f"--audio={audio_monitor}",
         "-C", "aac",
         "-P", "b:a=128k",
-        "-c", "libx264",
         "-m", "hls",
         # scale to target res and force SAR=1:1 so the TV sees 16:9, not 16:10
         "-F", f"scale={out_w}:{out_h},setsar=1",
-        "-p", "preset=ultrafast",
-        "-p", "tune=zerolatency",
+        *codec_args,
         "-p", "hls_time=1",
         "-p", "hls_list_size=3",
         "-p", "hls_flags=delete_segments",
         "-p", "pix_fmt=yuv420p",
-        "-p", "profile=main",
         "-f", os.path.join(hls_dir, "stream.m3u8"),
         "-o", monitor.name,
     ]
@@ -345,6 +353,32 @@ def stop_capture(result: "Optional[CaptureResult]") -> None:
         close_portal_capture(result.portal_session)
 
 
+def _hls_gst_video_encoder(element: str, bitrate_kbits: int, fps: int) -> list[str]:
+    """GStreamer H.264 encoder for the DLNA/Cast HLS portal pipeline."""
+    if element == "openh264enc":
+        return [
+            "openh264enc",
+            f"bitrate={bitrate_kbits * 1000}",
+            f"max-bitrate={bitrate_kbits * 1000}",
+            "rate-control=bitrate",
+            "enable-frame-skip=false",
+            f"gop-size={fps}",
+            "multi-thread=0",
+            "complexity=low",
+        ]
+    return [
+        "x264enc",
+        "tune=zerolatency",
+        "speed-preset=ultrafast",
+        f"bitrate={bitrate_kbits}",
+        f"key-int-max={fps}",
+        "threads=0",
+        "bframes=0",
+        "byte-stream=true",
+        "aud=true",
+    ]
+
+
 def _start_capture_portal(
     monitor: Monitor,
     fps: int = 30,
@@ -355,8 +389,12 @@ def _start_capture_portal(
         raise CaptureStartError("portal backend requires gst-launch-1.0")
 
     required = ("pipewiresrc", "videoconvert", "videoscale", "videorate",
-                "x264enc", "h264parse", "hlssink2")
+                "h264parse", "hlssink2")
     missing = [e for e in required if not _gst_has_element(e)]
+    # Stock Fedora (and Fedora Asahi Remix) has openh264enc but not x264enc.
+    video_encoder = next((e for e in ("x264enc", "openh264enc") if _gst_has_element(e)), None)
+    if video_encoder is None:
+        missing.append("x264enc or openh264enc")
     if missing:
         raise CaptureStartError(
             "portal backend requires missing GStreamer elements: " + ", ".join(missing)
@@ -424,15 +462,7 @@ def _start_capture_portal(
         "!", "videoconvert",
         "!", "videoscale", "add-borders=false",
         "!", f"video/x-raw,width={out_w},height={out_h},format=I420,pixel-aspect-ratio=1/1",
-        "!", "x264enc",
-        "tune=zerolatency",
-        "speed-preset=ultrafast",
-        f"bitrate={bitrate_kbits}",
-        f"key-int-max={fps}",
-        "threads=0",
-        "bframes=0",
-        "byte-stream=true",
-        "aud=true",
+        "!", *_hls_gst_video_encoder(video_encoder, bitrate_kbits, fps),
         "!", "h264parse", "config-interval=-1",
         "!", "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline",
         "!", "sink.video",
@@ -532,10 +562,14 @@ def _start_capture_x11grab(
     else:
         cmd += ["-vf", "format=yuv420p"]
 
+    # Deferred: wfd imports capture, so a top-level import would cycle.
+    from wfd.h264 import _ffmpeg_h264_encoder
+    if _ffmpeg_h264_encoder() == "libopenh264":
+        cmd += ["-c:v", "libopenh264", "-profile:v", "constrained_baseline",
+                "-rc_mode", "bitrate", "-allow_skip_frames", "0"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency"]
     cmd += [
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
         "-g", str(max(1, fps)),
